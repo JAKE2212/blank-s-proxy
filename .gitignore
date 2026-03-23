@@ -1,0 +1,27 @@
+# ── Secrets ───────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Dependencies ───────────────────────────────────────────
+node_modules/
+
+# ── Logs ──────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Data (runtime state — not source code) ────────────────
+data/
+
+# ── Dashboard bundle (auto-generated on startup) ──────────
+dashboard/dashboard.bundle.js
+
+# ── OS junk ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Editor junk ───────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
