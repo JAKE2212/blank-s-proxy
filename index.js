@@ -311,6 +311,9 @@ app.get("/health", (req, res) => {
     lastRequest: lastRequestTime,
     breaker: getBreakerStatus(),
     queue: getQueueStats(),
+    memory: {
+      heapUsedMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+    },
     extensions: extensions.map((e) => ({
       name: e.name ?? e.filename,
       version: e.version ?? "?",
