@@ -4,8 +4,13 @@
  * rag.js — Advanced RAG extension (priority 25)
  * Semantic memory retrieval using Qdrant + Ollama.
  *
- * transformRequest  → inject emotion instruction → retrieve relevant context → inject into system prompt
- * transformResponse → extract emotion tag → strip it → index turn with emotion → store for next retrieval
+ * v1.2.0 — Multi-character support
+ * Now extracts ALL named characters from each reply and indexes/retrieves
+ * context separately per character. Each character gets their own Qdrant
+ * collection and their own memory context block injected into the system prompt.
+ *
+ * transformRequest  → inject emotion instruction → retrieve context for each known char → inject into system prompt
+ * transformResponse → extract emotion tag → strip it → extract all char names → index turn per character
  * router            → dashboard API endpoints
  */
 
@@ -36,8 +41,8 @@ const DEFAULT_CONFIG = {
   emotionBoost: 0.1,
   decayMode: "exponential", // 'exponential' or 'linear'
   chunkingStrategy: "per_message", // 'per_message' or 'conversation_turns'
-  rules: [], // conditional activation rules
-  blindNextTurn: false, // if true, next indexed turn is marked temporally blind // score boost when emotion matches
+  rules: [],
+  blindNextTurn: false,
 };
 
 function loadConfig() {
@@ -79,20 +84,16 @@ This tag will be automatically stripped before the user sees it — do not menti
 
 /**
  * Extract and strip the <emotion> tag from the start of a reply.
- * Returns { emotion, cleanText }.
  * @param {string} text
  * @returns {{ emotion: string, cleanText: string }}
  */
 function extractEmotion(text) {
   if (!text) return { emotion: "neutral", cleanText: text };
-
   const match = text.match(/^<emotion>([a-z]+)<\/emotion>\s*/i);
   if (!match) return { emotion: "neutral", cleanText: text };
-
   const label = match[1].toLowerCase();
   const emotion = VALID_EMOTIONS.has(label) ? label : "neutral";
   const cleanText = text.slice(match[0].length);
-
   return { emotion, cleanText };
 }
 
@@ -111,20 +112,11 @@ function extractUserName(messages) {
       typeof msg.content === "string"
         ? msg.content
         : (msg.content?.[0]?.text ?? "");
-    // Match "Name : " pattern at start of message
     const match = text.match(/^([A-Z][a-zA-Z]{1,20})\s*:/);
     if (match) return match[1].toLowerCase();
   }
   return null;
 }
-
-/**
- * Extract character name from the AI's reply text.
- * Skips any name that matches the user's name.
- * @param {string} replyText
- * @param {string|null} userName  — blocklisted name
- * @returns {string}
- */
 
 const PRONOUN_BLOCKLIST = new Set([
   "he",
@@ -143,10 +135,37 @@ const PRONOUN_BLOCKLIST = new Set([
   "my",
   "your",
   "i",
+  // Common non-name words that start sentences
+  "the",
+  "a",
+  "an",
+  "this",
+  "that",
+  "these",
+  "those",
+  "one",
+  "two",
+  "three",
+  "then",
+  "when",
+  "where",
+  "what",
 ]);
 
-function extractCharNameFromReply(replyText, userName) {
-  if (!replyText) return "unknown";
+/**
+ * Extract ALL unique character names from a reply.
+ * Scans every line for possessive patterns and action verbs.
+ * Returns a deduplicated array of lowercase names, excluding the user's name
+ * and common pronouns/words.
+ *
+ * @param {string}      replyText
+ * @param {string|null} userName   — blocklisted name (the user's character)
+ * @returns {string[]}             — e.g. ['kurt', 'dale']
+ */
+function extractAllCharNamesFromReply(replyText, userName) {
+  if (!replyText) return [];
+
+  const found = new Set();
 
   const lines = replyText
     .split("\n")
@@ -159,22 +178,39 @@ function extractCharNameFromReply(replyText, userName) {
       .replace(/\[.*?\]/g, "")
       .trim();
 
-    const possessive = clean.match(/^([A-Z][a-z]{1,20})'s\b/);
-    if (possessive) {
-      const name = possessive[1].toLowerCase();
-      if (name !== userName && !PRONOUN_BLOCKLIST.has(name)) return name;
+    // Pattern 1 — possessive: "Kurt's jaw tightened"
+    const possessiveMatches = clean.matchAll(/\b([A-Z][a-z]{1,20})'s\b/g);
+    for (const m of possessiveMatches) {
+      const name = m[1].toLowerCase();
+      if (name !== userName && !PRONOUN_BLOCKLIST.has(name)) {
+        found.add(name);
+      }
     }
 
-    const action = clean.match(
-      /^([A-Z][a-z]{1,20})\s+(?:stepped|turned|said|looked|felt|moved|stood|walked|ran|smiled|frowned|crossed|glanced|stared|grabbed|reached|spoke|asked|replied|growled|snapped|sighed|laughed|narrowed|clenched|exhaled|inhaled|shrugged|nodded|shook)/,
+    // Pattern 2 — action verb: "Kurt stepped forward"
+    const actionMatches = clean.matchAll(
+      /\b([A-Z][a-z]{1,20})\s+(?:stepped|turned|said|looked|felt|moved|stood|walked|ran|smiled|frowned|crossed|glanced|stared|grabbed|reached|spoke|asked|replied|growled|snapped|sighed|laughed|narrowed|clenched|exhaled|inhaled|shrugged|nodded|shook|leaned|pulled|pushed|dropped|raised|lowered|tilted|pressed|placed|held|kept|let|made|gave|took|came|went|sat|lay|rose|fell|spun|jerked|flinched|tensed|relaxed|watched|waited|paused|stopped|started|opened|closed|turned|moved|shifted|stepped|backed|leaned|reached|stretched|twisted|arched|curled|spread|folded|crossed)\b/g,
     );
-    if (action) {
-      const name = action[1].toLowerCase();
-      if (name !== userName && !PRONOUN_BLOCKLIST.has(name)) return name;
+    for (const m of actionMatches) {
+      const name = m[1].toLowerCase();
+      if (name !== userName && !PRONOUN_BLOCKLIST.has(name)) {
+        found.add(name);
+      }
+    }
+
+    // Pattern 3 — dialogue attribution: `"text," Kurt said` or `"text." Kurt`
+    const dialogueMatches = clean.matchAll(
+      /["'][^"']+["']\s*[,.]?\s*([A-Z][a-z]{1,20})\b/g,
+    );
+    for (const m of dialogueMatches) {
+      const name = m[1].toLowerCase();
+      if (name !== userName && !PRONOUN_BLOCKLIST.has(name)) {
+        found.add(name);
+      }
     }
   }
 
-  return "unknown";
+  return [...found];
 }
 
 /**
@@ -196,11 +232,12 @@ function buildQueryText(messages, depth) {
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
+
 const _stats = {
   lastInjectionChars: 0,
-  lastInjectionChar: "none",
-  lastInjectionMsg: 0,
-  lastIndexedChar: "none",
+  lastInjectionChars_total: 0,
+  lastActiveChars: [],
+  lastIndexedChars: [],
   lastIndexedMsg: 0,
   lastEmotion: "none",
   totalInjections: 0,
@@ -213,6 +250,7 @@ let _pending = null;
 let _lastUserText = null;
 
 // ── Router ────────────────────────────────────────────────────────────────────
+
 const router = express.Router();
 
 router.get("/status", (req, res) => {
@@ -261,7 +299,6 @@ router.delete("/collections/:name", async (req, res) => {
   }
 });
 
-// POST /extensions/rag/blind-next — mark next indexed turn as temporally blind
 router.post("/blind-next", (req, res) => {
   try {
     const current = loadConfig();
@@ -302,27 +339,27 @@ async function transformRequest(payload) {
   // Extract user name for blocklisting
   const userName = extractUserName(messages);
 
-  // Grab last user message for indexing later
+  // Grab last user message text for indexing later
   const lastUserMsg = messages.findLast((m) => m.role === "user");
   const userText =
     typeof lastUserMsg?.content === "string"
       ? lastUserMsg.content
       : (lastUserMsg?.content?.[0]?.text ?? "");
 
-  // Use char name + emotion from previous turn
-  const knownCharName = _pending?.lastCharName ?? "unknown";
+  // Carry known char names + emotion from previous turn
+  const knownCharNames = _pending?.lastCharNames ?? [];
   const currentEmotion = _pending?.lastEmotion ?? "neutral";
 
   // Carry state forward to transformResponse
   _pending = {
     userText,
     msgCount,
-    lastCharName: knownCharName,
+    lastCharNames: knownCharNames,
     lastEmotion: currentEmotion,
     userName,
   };
 
-  // Detect reroll — same user message as last time, skip indexing this turn
+  // Detect reroll — same user message as last time
   const isReroll = userText && userText === _lastUserText;
   if (isReroll) {
     console.log("[rag] Reroll detected — skipping index this turn");
@@ -340,48 +377,80 @@ async function transformRequest(payload) {
     });
   }
 
-  // Skip retrieval on first message or no query
-  if (!queryText || knownCharName === "unknown") {
+  // Skip retrieval if no query or no known characters yet
+  if (!queryText || knownCharNames.length === 0) {
+    if (knownCharNames.length === 0) {
+      console.log(
+        "[rag] No known characters yet — skipping retrieval this turn",
+      );
+    }
     return { ...payload, messages: newMessages };
   }
 
-  let context = null;
-  try {
-    context = await retrieve(
-      {
-        charName: knownCharName,
-        queryText,
-        currentIndex: msgCount,
-        emotion: currentEmotion,
-        emotionBoost: config.emotionBoost,
-      },
-      config,
-    );
-  } catch (e) {
-    console.warn("[rag] Retrieval failed (non-fatal):", e.message);
+  // Retrieve context for each known character independently
+  const contextBlocks = [];
+  for (const charName of knownCharNames) {
+    let context = null;
+    try {
+      context = await retrieve(
+        {
+          charName,
+          queryText,
+          currentIndex: msgCount,
+          emotion: currentEmotion,
+          emotionBoost: config.emotionBoost,
+        },
+        config,
+      );
+    } catch (e) {
+      console.warn(
+        `[rag] Retrieval failed for "${charName}" (non-fatal):`,
+        e.message,
+      );
+      continue;
+    }
+
+    if (context) {
+      const trimmed = context.slice(0, config.maxInjectionChars);
+      contextBlocks.push({ charName, context: trimmed });
+      console.log(
+        `[rag] Retrieved ${trimmed.length} chars for "${charName}" (emotion: ${currentEmotion})`,
+      );
+    }
+  }
+
+  if (contextBlocks.length === 0) {
     return { ...payload, messages: newMessages };
   }
 
-  if (!context) return { ...payload, messages: newMessages };
+  // Build combined injection — one labeled block per character
+  const combined = contextBlocks
+    .map(
+      ({ charName, context }) =>
+        `[Relevant Memory Context — ${charName}]\n${context}\n[End Memory Context — ${charName}]`,
+    )
+    .join("\n\n");
 
-  const injected = context.slice(0, config.maxInjectionChars);
-
-  // Prepend context to system prompt
+  // Prepend combined context to system prompt
   newMessages = newMessages.map((m) => {
     if (m.role !== "system") return m;
     const existing = typeof m.content === "string" ? m.content : "";
-    return { ...m, content: `${injected}\n\n${existing}` };
+    return { ...m, content: `${combined}\n\n${existing}` };
   });
 
   if (!newMessages.find((m) => m.role === "system")) {
-    newMessages.unshift({ role: "system", content: injected });
+    newMessages.unshift({ role: "system", content: combined });
   }
 
-  console.log(
-    `[rag] Injected ${injected.length} chars for "${knownCharName}" (emotion: ${currentEmotion})`,
+  const totalChars = contextBlocks.reduce(
+    (sum, b) => sum + b.context.length,
+    0,
   );
-  _stats.lastInjectionChars = injected.length;
-  _stats.lastInjectionChar = knownCharName;
+  const charList = contextBlocks.map((b) => b.charName).join(", ");
+  console.log(`[rag] Injected ${totalChars} total chars for: ${charList}`);
+
+  _stats.lastInjectionChars = totalChars;
+  _stats.lastActiveChars = contextBlocks.map((b) => b.charName);
   _stats.lastInjectionMsg = msgCount;
   _stats.totalInjections++;
 
@@ -413,49 +482,79 @@ async function transformResponse(data) {
     };
   }
 
-  // Extract char name from clean reply (emotion tag already stripped)
-  const charName = extractCharNameFromReply(cleanText, _pending.userName);
-  if (charName !== "unknown") _pending.lastCharName = charName;
-  const effectiveCharName = _pending.lastCharName ?? charName;
+  // Extract ALL character names from the clean reply
+  const foundNames = extractAllCharNamesFromReply(cleanText, _pending.userName);
+
+  // Merge newly found names with known names from previous turns
+  // Use a Set to deduplicate — characters accumulate over the session
+  const mergedNames = [
+    ...new Set([...(_pending.lastCharNames ?? []), ...foundNames]),
+  ];
+
+  if (foundNames.length > 0) {
+    console.log(`[rag] Characters found in reply: ${foundNames.join(", ")}`);
+  }
+
+  // Always carry forward the latest merged list + emotion for next request
+  _pending.lastCharNames = mergedNames;
   _pending.lastEmotion = emotion;
 
-  // Skip indexing on rerolls — don't store duplicate responses
+  // Skip indexing on rerolls
   if (_pending.isReroll) {
-    if (charName !== "unknown") _pending.lastCharName = charName;
-    _pending.lastEmotion = emotion;
     return finalData;
   }
 
-  // Index the turn with emotion
-  try {
-    await indexTurn(
-      {
-        charName: effectiveCharName,
-        userText: _pending.userText ?? "",
-        assistantText: cleanText,
-        messageIndex: _pending.msgCount,
-        emotion,
-        temporallyBlind: config.blindNextTurn === true,
-      },
-      config,
-    );
-    // Auto-reset blindNextTurn after use
-    if (config.blindNextTurn) {
+  // Index the turn once per character found in THIS reply
+  // (Only index chars active in this specific message, not all historical chars)
+  if (foundNames.length === 0) {
+    console.log("[rag] No character names found in reply — skipping index");
+    return finalData;
+  }
+
+  const isBlind = config.blindNextTurn === true;
+  const indexedNames = [];
+
+  for (const charName of foundNames) {
+    try {
+      await indexTurn(
+        {
+          charName,
+          userText: _pending.userText ?? "",
+          assistantText: cleanText,
+          messageIndex: _pending.msgCount,
+          emotion,
+          temporallyBlind: isBlind,
+        },
+        config,
+      );
+      indexedNames.push(charName);
+    } catch (e) {
+      console.warn(
+        `[rag] Index failed for "${charName}" (non-fatal):`,
+        e.message,
+      );
+    }
+  }
+
+  // Auto-reset blindNextTurn after use
+  if (isBlind && indexedNames.length > 0) {
+    try {
       const current = loadConfig();
       fs.writeFileSync(
         CONFIG_PATH,
         JSON.stringify({ ...current, blindNextTurn: false }, null, 2),
       );
       console.log("[rag] Temporally blind turn indexed — flag reset");
-    }
+    } catch {}
+  }
+
+  if (indexedNames.length > 0) {
     console.log(
-      `[rag] Indexed turn for "${effectiveCharName}" (msg ${_pending.msgCount}, emotion: ${emotion})`,
+      `[rag] Indexed turn for: ${indexedNames.join(", ")} (msg ${_pending.msgCount}, emotion: ${emotion})`,
     );
-    _stats.lastIndexedChar = charName;
+    _stats.lastIndexedChars = indexedNames;
     _stats.lastIndexedMsg = _pending.msgCount;
-    _stats.totalIndexed++;
-  } catch (e) {
-    console.warn("[rag] Index failed (non-fatal):", e.message);
+    _stats.totalIndexed += indexedNames.length;
   }
 
   return finalData;
@@ -463,7 +562,7 @@ async function transformResponse(data) {
 
 module.exports = {
   name: "Retrieval-Augmented Generation (RAG)",
-  version: "1.1.0",
+  version: "1.2.0",
   priority: 25,
   router,
   transformRequest,
