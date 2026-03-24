@@ -23,6 +23,7 @@ This document describes how the Kiana Proxy extension system works, how to write
   - [tunnelvision.js](#tunnelvisionjs)
   - [samplers.js](#samplersjs)
   - [prose-polisher.js](#prose-polisherjs)
+  - [recast.js](#recastjs)
 
 ---
 
@@ -227,17 +228,18 @@ Standard Express router — use `router.get`, `router.post`, `router.put`, `rout
 
 Lower number = runs earlier in the pipeline.
 
-| Priority | Extension        |
-|----------|-----------------|
-| 10       | ooc.js           |
-| 20       | regex.js         |
-| 25       | rag.js           |
-| 26       | tunnelvision.js  |
-| 30       | samplers.js      |
-| 40       | prose-polisher.js|
+| Priority | Extension         |
+|----------|-------------------|
+| 10       | ooc.js            |
+| 20       | regex.js          |
+| 25       | rag.js            |
+| 26       | tunnelvision.js   |
+| 30       | samplers.js       |
+| 40       | prose-polisher.js |
+| 45       | recast.js         |
 
-`transformRequest` runs lowest → highest (10 first, 40 last).  
-`transformResponse` runs in the same order (10 first, 40 last).
+`transformRequest` runs lowest → highest (10 first, 45 last).  
+`transformResponse` runs in the same order (10 first, 45 last).
 
 Pick a priority that makes sense relative to others. Leave gaps between values so you can insert new extensions without renumbering.
 
@@ -409,3 +411,89 @@ Server-side repetition avoidance. Tracks n-grams across responses with exponenti
 **State file:** `data/prose-polisher-state.json`
 
 **Routes:** none
+
+---
+
+### recast.js
+
+**Priority:** 45 | **Hooks:** `transformRequest`, `transformResponse` | **Routes:** `/extensions/recast/*`
+
+"The 4 Steps of Roleplay" — a background quality-control pipeline that runs after every AI response. Each step judges the reply with a fast YES/NO check call. On failure, a rewrite pass runs and the check repeats. A configurable retry cap prevents infinite loops. The final output silently replaces the original reply before JanitorAI sees it.
+
+Runs last in the pipeline (priority 45) so it checks the fully post-processed reply after all other extensions have had their turn.
+
+**The 4 Steps:**
+
+| Step | Name | Checks |
+|------|------|--------|
+| 1 | System Prompt Compliance | Format rules, response header, acoustic payload mandate, show-don't-tell, forbidden elements |
+| 2 | Characters | Voice, speech patterns, personality consistency, proportional emotional reactions |
+| 3 | World | Physical/causal coherence, no retcons, persistent environment, time/resource realism |
+| 4 | Story Progression | Narrative momentum, no stagnation, no unearned intensity jumps, scene closure law |
+
+**Check flow per step:**
+```
+Check (YES/NO) → PASS: move to next step
+              → FAIL: Rewrite → Recheck → PASS: move on
+                              → FAIL again: retry up to maxRetries, then pass through
+```
+
+**Character card extraction** (with fallbacks for untagged cards):
+1. `<CharName's Persona>...</CharName's Persona>` — JanitorAI standard
+2. `<CharName>...</CharName>` — bare inner tag
+3. First 3000 chars of system prompt — untagged cards always lead with character info
+
+**User persona extraction** (with fallbacks):
+1. `<UserPersona>...</UserPersona>` — standard tag
+2. Last 500 chars of system prompt — JanitorAI always appends user persona at the bottom
+
+**Config file:** `data/recast-config.json`
+
+```js
+// Config shape
+{
+  enabled:       boolean,  // master on/off
+  maxRetries:    number,   // max rewrite attempts per step before giving up (default: 2)
+  checkModel:    string,   // model for YES/NO checks — '' = use request model
+  rewriteModel:  string,   // model for rewrites — '' = use request model
+  checkTokens:   number,   // max tokens for check responses (default: 100)
+  rewriteTokens: number,   // max tokens for rewrite responses (default: 2048)
+  steps: {
+    step1: { enabled: boolean, name: string, description: string },
+    step2: { enabled: boolean, name: string, description: string },
+    step3: { enabled: boolean, name: string, description: string },
+    step4: { enabled: boolean, name: string, description: string },
+  }
+}
+```
+
+**Recommended model config:**
+- `checkModel`: a fast cheap model — e.g. `anthropic/claude-haiku-4-5` (checks need ~100 tokens)
+- `rewriteModel`: a stronger model — e.g. `anthropic/claude-sonnet-4-6` (rewrites need quality)
+- Both default to the request model if left blank
+
+**Routes:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET`  | `/status`  | Enabled state, step list, current model config, maxRetries |
+| `GET`  | `/config`  | Full config object |
+| `POST` | `/config`  | Update config (supports partial + deep step updates) |
+
+**Console log output:**
+```
+[recast] ✦ Finished response! Checking message through 4 steps...
+[recast] 🔍 Doing check 1 — Step 1 — System Prompt Compliance...
+[recast] ✅ Step 1 — System Prompt Compliance — PASSED! Moving to next check...
+[recast] 🔍 Doing check 2 — Step 2 — Characters...
+[recast] ❌ Step 2 — Characters — FAILED! Rewriting... (attempt 1/2)
+[recast] ✏  Step 2 — Characters — Rewrite done. Rechecking...
+[recast] ✅ Step 2 — Characters — PASSED! Moving to next check...
+[recast] 🎉 All checks done! Sending message to JanitorAI.
+```
+
+**What can go wrong:**
+- `_pending` is module-level — concurrent requests will overwrite each other's stashed context (same issue as rag.js and tunnelvision.js). Reduce `MAX_CONCURRENT` to 1 if this causes problems.
+- Each failed step costs 2 extra API calls (rewrite + recheck). With 4 steps and `maxRetries: 2`, worst case is 12 extra calls per response. Set `checkModel` to a cheap/fast model to limit cost.
+- If `checkModel` is slow, the entire response pipeline blocks while recast runs. Haiku-class models are strongly recommended for checks.
+- Step checks are binary — a model that ignores the YES/NO instruction and writes prose will never match `startsWith('YES')` and will always trigger rewrites. If this happens, switch to a model that follows short instructions reliably.

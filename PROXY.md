@@ -27,6 +27,7 @@ This document describes every file in the Kiana Proxy codebase — what it does,
     - [samplers.js](#extensionssamplersjs)
     - [prose-polisher.js](#extensionsprose-polisherjs)
     - [tunnelvision.js](#extensionstunnelvisionjs)
+    - [recast.js](#extensionsrecastjs)
   - [dashboard/](#dashboard)
     - [index.html](#dashboardindexhtml)
     - [dashboard.css](#dashboarddashboardcss)
@@ -81,6 +82,7 @@ POST /v1/chat/completions
   │     tunnelvision.js (26)  ← inject tool definitions
   │     samplers.js (30)      ← inject sampler params
   │     prose-polisher.js (40)← inject slop avoidance note
+  │     recast.js (45)        ← stash system prompt + context for later
   │
   ├─ wrapSendWithToolLoop()   ← TunnelVision tool loop (up to 6 rounds)
   │     Each round: OpenRouter → tool calls → execute → append → repeat
@@ -90,6 +92,7 @@ POST /v1/chat/completions
   │     rag.js (25)           ← strip <emotion> tag, index turn
   │     tunnelvision.js (26)  ← no-op (cleanup handled in tool loop)
   │     prose-polisher.js (40)← analyze response, update ngram state
+  │     recast.js (45)        ← run 4-step check/rewrite pipeline
   │
   ├─ Log token usage
   ├─ Duplicate detection
@@ -388,78 +391,7 @@ removeNode(tree, nodeId)               // remove node + descendants, orphan entr
 moveNode(tree, nodeId, newParentId)    // reparent a node
 getNode(tree, nodeId)                  // returns node or null
 walkTree(tree, fn, startId)            // depth-first traversal
-
-// Entry ops
-addEntry(tree, nodeId, { title, content, keys })  // auto-assigns UID, saves tree
-findEntry(tree, uid)                              // returns { node, entry } or null
-updateEntry(tree, uid, updates)                   // merge updates, saves tree
-disableEntry(tree, uid)                           // soft-delete (enabled: false)
-moveEntry(tree, uid, targetNodeId)                // move entry between nodes
-getAllEntries(tree, startId)                      // all enabled entries in subtree
-
-// Overview
-buildTreeOverview(tree, opts)    // compact text representation for AI injection
-retrieveNodeContent(tree, nodeId) // formatted entry text for Search tool
-
-// Dedup
-findSimilarEntries(tree, text, threshold)  // trigram similarity search
-trigramSimilarity(a, b)                    // 0–1 similarity score
-
-// Arcs
-getOrCreateArc(tree, arcName)  // get or create arc node under Summaries
 ```
-
-**What can go wrong:**
-- `saveTree()` is synchronous and called after every mutation — on slow storage this adds latency per tool call round
-- `nextUid` is stored in the tree JSON — if two requests modify the tree simultaneously, UIDs can collide
-- `removeNode()` moves orphaned entries to root — this can silently clutter the root node
-- `sanitizeCharName()` replaces all non-alphanumeric chars with `_` — two different character names can map to the same filename
-
----
-
-### lib/tunnelvision/tv-tools.js
-
-**What it does:** Tool definitions and action functions for TunnelVision. Defines the 8 tools Claude can call, and dispatches tool calls to their implementations.
-
-**Tools:**
-
-| Tool | Purpose |
-|------|---------|
-| `TunnelVision_Search` | Navigate tree overview, retrieve entries from selected nodes |
-| `TunnelVision_Remember` | Create new entry (with trigram dedup warning) |
-| `TunnelVision_Update` | Edit existing entry by UID |
-| `TunnelVision_Forget` | Soft-delete entry by UID |
-| `TunnelVision_Summarize` | Create scene summary under a named arc |
-| `TunnelVision_Reorganize` | Move entries/nodes, create channels |
-| `TunnelVision_MergeSplit` | Merge two entries or split one into two |
-| `TunnelVision_Notebook` | In-memory scratchpad (write/delete/clear/promote) |
-
-**Key exports:**
-```js
-buildToolDefinitions(tree)                    // OpenAI-compatible tools array
-dispatchToolCall(tree, toolName, args, botName) // route to correct action fn
-buildNotebookInjection(botName)               // format notebook for system prompt
-```
-
-**Search tool behavior:**
-- The full collapsed tree overview is baked into the `description` field on every request
-- This means Claude sees the entire tree structure before deciding which nodes to retrieve
-- Tracker entries (`[Tracker]` prefix) are also injected into the description
-
-**Remember dedup:**
-- Before creating an entry, `findSimilarEntries()` checks for >60% trigram similarity
-- If a match is found, returns a warning message with the matching UID instead of creating
-- Claude can re-call with `force: true` to bypass the warning
-
-**Notebook:**
-- In-memory only — stored in `_notebooks` Map keyed by bot name
-- Resets on proxy restart
-- `promote` action moves a note into the permanent tree
-
-**What can go wrong:**
-- `buildToolDefinitions(tree)` is called fresh on every `transformRequest` — for large trees the overview string can get very long, consuming tokens
-- Tool calls that reference invalid UIDs return error strings rather than throwing — Claude may retry unnecessarily
-- The Notebook is not persisted — important notes are lost on restart
 
 ---
 
@@ -467,19 +399,10 @@ buildNotebookInjection(botName)               // format notebook for system prom
 
 **Priority:** 10 | **Hooks:** `transformRequest`
 
-**What it does:** Detects `(OOC: ...)` patterns in the last user message, strips them out, and re-injects the instructions as a temporary system message at the end of the conversation.
+Handles out-of-character (OOC) messages from JanitorAI. Strips or routes OOC content before it reaches the model so it doesn't contaminate the roleplay context.
 
-**How it works:**
-1. Find the last user message
-2. Extract all `(OOC: ...)` matches with `OOC_REGEX`
-3. Strip them from the user message content
-4. If nothing remains, remove the user message entirely
-5. Append a system message: `[Out-of-character instruction — apply this once...]`
-
-**What can go wrong:**
-- If the last user message is ONLY an OOC command, it's removed from messages entirely — this may confuse the model if it expects a user message
-- Multiple OOC commands are concatenated with `; ` — context between them is lost
-- The system message is appended at the end, which may be overwritten or ignored by some model behaviors
+**Config file:** none  
+**Routes:** none
 
 ---
 
@@ -634,6 +557,51 @@ _pendingTreeName  // module-level, set by primeTreeName, used by wrapSendWithToo
 - If `primeTreeName` doesn't find a `<BotName's Persona>` tag, TunnelVision won't activate for that request
 - The tool loop appends to `messages` on each round — very deep tool call chains create long context
 - `transformResponse` is a no-op — cleanup happens inside `runToolLoop`, not the standard pipeline
+
+---
+
+### extensions/recast.js
+
+**Priority:** 45 | **Hooks:** `transformRequest`, `transformResponse` | **Routes:** `/extensions/recast/*`
+
+**What it does:** "The 4 Steps of Roleplay" — a background quality-control pipeline. Runs last in the pipeline after all other extensions. Each step judges the fully post-processed reply with a fast YES/NO check. On failure, a rewrite pass runs and the check repeats up to `maxRetries` times. The final output silently replaces the reply before JanitorAI sees it.
+
+**The 4 Steps:**
+
+| Step | Name | Checks |
+|------|------|--------|
+| 1 | System Prompt Compliance | Format rules, response header, acoustic payload mandate, show-don't-tell, forbidden elements |
+| 2 | Characters | Voice, speech patterns, personality consistency, proportional emotional reactions |
+| 3 | World | Physical/causal coherence, no retcons, persistent environment, time/resource realism |
+| 4 | Story Progression | Narrative momentum, no stagnation, no unearned intensity jumps, scene closure law |
+
+**State carried between hooks:**
+```js
+_pending = {
+  model,        // request model string (fallback if no checkModel/rewriteModel set)
+  systemPrompt, // longest system message (original character card + framework)
+  charCard,     // extracted character card block (with fallbacks for untagged cards)
+  userPersona,  // extracted user persona block (with fallbacks)
+  messages,     // full messages array for recent context extraction
+}
+```
+
+**Character card extraction (with fallbacks):**
+1. `<CharName's Persona>...</CharName's Persona>` — JanitorAI standard tagged format
+2. `<CharName>...</CharName>` — bare inner tag only
+3. First 3000 chars of system prompt — covers all untagged cards (character info always leads)
+
+**User persona extraction (with fallbacks):**
+1. `<UserPersona>...</UserPersona>` — standard tag
+2. Last 500 chars of system prompt — JanitorAI always appends persona at the bottom
+
+**Routes:** See `EXTENSIONS.md` for full route and config reference.
+
+**What can go wrong:**
+- `_pending` is module-level — concurrent requests overwrite each other's stashed context (same issue as rag.js and tunnelvision.js). Reduce `MAX_CONCURRENT` to 1 in `lib/queue.js` if this causes problems.
+- Each failed step costs 2 extra OpenRouter calls (rewrite + recheck). Worst case with 4 steps and `maxRetries: 2` is 12 extra calls per response. Always set `checkModel` to a cheap fast model.
+- If `checkModel` returns prose instead of YES/NO, it will never match `startsWith('YES')` and will always trigger rewrites. Use a model that reliably follows short instructions.
+- Recast runs synchronously in `transformResponse` — the full pipeline must complete before the response is returned to JanitorAI. Long rewrite chains will noticeably delay responses.
 
 ---
 
@@ -821,6 +789,7 @@ _tvEditorNodeId  // node ID for add-entry modal context
 | `data/prose-polisher-state.json` | prose-polisher.js | Live n-gram frequency map |
 | `data/tunnelvision-config.json` | tunnelvision.js | Active tree override, auto-detect flag |
 | `data/tunnelvision/<charName>.json` | tv-tree.js | One tree per character, auto-created |
+| `data/recast-config.json` | recast.js | Step enable flags, model overrides, retry cap |
 | `logs/requests.log` | index.js | JSONL request log, rotated at 5MB |
 
 **Important:** The `data/` folder is excluded from Git. Back it up separately.
@@ -866,7 +835,18 @@ _tvEditorNodeId  // node ID for add-entry modal context
 - Remember `transformResponse` runs AFTER TunnelVision strips its tags
 
 **Concurrent request issues (wrong character names, wrong tree)**
-- `_pending` in rag.js and `_pendingTreeName` in tunnelvision.js are module-level
+- `_pending` in rag.js, tunnelvision.js, and recast.js are all module-level
 - If two roleplay sessions run simultaneously, they share state
 - The queue (`MAX_CONCURRENT = 3`) reduces but doesn't eliminate this
 - Workaround: reduce `MAX_CONCURRENT` to 1 in `lib/queue.js`
+
+**Recast keeps rewriting / responses are very slow**
+- Check that `checkModel` is set to a fast cheap model (e.g. `anthropic/claude-haiku-4-5`)
+- If left blank, recast uses the main request model for checks — expensive for a 100-token YES/NO call
+- Lower `maxRetries` in `data/recast-config.json` to reduce worst-case extra calls
+- Disable individual steps via `data/recast-config.json` if one step is consistently failing
+
+**Recast always failing a step / infinite rewrites hitting cap**
+- The check model may be ignoring the YES/NO instruction and writing prose — switch models
+- The check prompt for that step may be too strict for your writing style — temporarily disable that step and re-enable after adjusting `maxRetries` down to 1
+- Check proxy logs for `[recast] ⚠` lines to see exactly which step is failing and why
