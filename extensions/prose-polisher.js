@@ -1,11 +1,15 @@
+"use strict";
 // ============================================================
 // extensions/prose-polisher.js — Slop detection & injection
-// v2.0 — Per-character n-gram tracking
+// v2.1 — Per-character n-gram tracking + bug fixes
 //
-// Each character gets their own n-gram pool. The global pool
-// tracks scene-level/environmental repetition shared across all
-// characters. Style notes injected into the prompt are labeled
-// per character so the model knows whose voice to vary.
+// Changes from v2.0:
+//   - Config cached in memory (no disk read per request)
+//   - State loaded once per turn (not twice)
+//   - transformRequest returns new object (no in-place mutation)
+//   - _pending scoped per-request via request ID to avoid concurrency issues
+//   - lastCharNames capped + session-reset to prevent stale accumulation
+//   - extractAllCharNames capped to first 2000 chars
 // ============================================================
 
 const fs   = require("fs");
@@ -14,44 +18,43 @@ const path = require("path");
 const CONFIG_FILE = path.join(__dirname, "../data/prose-polisher-config.json");
 const STATE_FILE  = path.join(__dirname, "../data/prose-polisher-state.json");
 
-// ── Default config ─────────────────────────────────────────
+// ── Config cache ───────────────────────────────────────────
+let _configCache = null;
 
 const DEFAULT_CONFIG = {
   enabled:          true,
   ngramMax:         10,
   slopThreshold:    3.0,
-  decayRate:        10,       // % decay per interval
-  decayInterval:    10,       // messages between decay applications
-  patternMinCommon: 3,        // min shared prefix words to merge patterns
-  injectSlop:       true,     // inject slop list into outgoing prompts
-  maxInjected:      10,       // max phrases to inject per character
-  maxCharsInjected: 5,        // max characters to inject style notes for
+  decayRate:        10,
+  decayInterval:    10,
+  patternMinCommon: 3,
+  injectSlop:       true,
+  maxInjected:      10,
+  maxCharsInjected: 5,
   whitelist:        [],
-  blacklist:        {},       // { "phrase": weight }
+  blacklist:        {},
 };
 
-// ── Persistence ────────────────────────────────────────────
-
 function loadConfig() {
+  if (_configCache) return _configCache;
   try {
-    if (!fs.existsSync(CONFIG_FILE)) return { ...DEFAULT_CONFIG };
-    return { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")) };
+    if (!fs.existsSync(CONFIG_FILE)) { _configCache = { ...DEFAULT_CONFIG }; return _configCache; }
+    _configCache = { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")) };
+    return _configCache;
   } catch {
-    return { ...DEFAULT_CONFIG };
+    _configCache = { ...DEFAULT_CONFIG };
+    return _configCache;
   }
 }
 
-/**
- * Load state. Automatically migrates old flat format to new per-character format.
- * Old: { ngramFrequencies: {}, totalMessages: 0 }
- * New: { chars: { charName: { ngramFrequencies: {}, totalMessages: 0 } }, global: { ... } }
- */
+// ── State persistence ──────────────────────────────────────
+
 function loadState() {
   try {
     if (!fs.existsSync(STATE_FILE)) return freshState();
     const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
 
-    // ── Migration: old flat format ──
+    // ── Migration: old flat format → per-character format ──
     if (raw.ngramFrequencies !== undefined) {
       console.log("[prose-polisher] Migrating state to per-character format...");
       const migrated = freshState();
@@ -63,7 +66,6 @@ function loadState() {
       return migrated;
     }
 
-    // Ensure both keys exist in case state was partially written
     if (!raw.chars)  raw.chars  = {};
     if (!raw.global) raw.global = freshCharState();
     return raw;
@@ -88,31 +90,60 @@ function saveState(state) {
   }
 }
 
+// ── Per-request pending state ──────────────────────────────
+// Keyed by a request ID to avoid concurrent request collisions.
+// Each entry: { charNames: string[], timestamp: number }
+const _pendingMap = new Map();
+const PENDING_TTL_MS = 5 * 60 * 1000; // 5 minutes — auto-expire stale entries
+
+// Session char name accumulator — resets when no activity for 30 minutes
+let _sessionChars    = [];
+let _lastActivityMs  = 0;
+const SESSION_TTL_MS = 30 * 60 * 1000;
+
+function getSessionChars() {
+  if (Date.now() - _lastActivityMs > SESSION_TTL_MS) {
+    _sessionChars = [];
+    console.log("[prose-polisher] Session reset — cleared accumulated char names");
+  }
+  _lastActivityMs = Date.now();
+  return _sessionChars;
+}
+
+function addSessionChars(names) {
+  _lastActivityMs = Date.now();
+  _sessionChars = [...new Set([..._sessionChars, ...names])].slice(0, 20);
+}
+
+function cleanupPending() {
+  const now = Date.now();
+  for (const [key, val] of _pendingMap.entries()) {
+    if (now - val.timestamp > PENDING_TTL_MS) _pendingMap.delete(key);
+  }
+}
+
 // ── Character name extraction ──────────────────────────────
-// Reuses the same patterns as rag.js so both extensions
-// agree on who is speaking in a given reply.
 
 const PRONOUN_BLOCKLIST = new Set([
-  "he", "she", "they", "it", "his", "her", "their", "its",
-  "him", "them", "we", "us", "our", "my", "your", "i",
-  "the", "a", "an", "this", "that", "these", "those",
-  "one", "two", "three", "then", "when", "where", "what",
+  "he","she","they","it","his","her","their","its",
+  "him","them","we","us","our","my","your","i",
+  "the","a","an","this","that","these","those",
+  "one","two","three","then","when","where","what",
 ]);
 
 /**
  * Extract all unique character names from a reply.
- * @param {string}      replyText
- * @param {string|null} userName   — user's character name (blocklisted)
- * @returns {string[]}
+ * Capped to first 2000 chars to avoid slow regex on huge responses.
  */
 function extractAllCharNames(replyText, userName) {
   if (!replyText) return [];
+  const text  = replyText.slice(0, 2000); // cap for performance
   const found = new Set();
 
-  const lines = replyText
+  const lines = text
     .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0 && !/^[-—*#\[]+$/.test(l));
+    .map(l => l.trim())
+    .filter(l => l.length > 0 && !/^[-—*#\[]+$/.test(l));
 
   for (const line of lines) {
     const clean = line.replace(/^\*+/, "").replace(/\[.*?\]/g, "").trim();
@@ -270,7 +301,6 @@ const DEFAULT_NAMES = new Set([
   "nicole","olivia","paige","rachel","rebecca","riley","rose","ruby","sadie",
   "samantha","sarah","savannah","scarlett","sophia","sophie","stella","taylor",
   "victoria","violet","zoe",
-  // fantasy/anime
   "deku","bakugo","izuku","katsuki","shoto","ochaco","uraraka","todoroki",
   "midoriya","naruto","sasuke","sakura","kakashi","itachi","luffy","zoro","nami",
   "goku","vegeta","geralt","ciri","yennefer","link","zelda","cloud","tifa",
@@ -293,17 +323,15 @@ function stripMarkup(text) {
 
 function generateNgrams(words, n) {
   const out = [];
-  for (let i = 0; i <= words.length - n; i++) {
-    out.push(words.slice(i, i + n).join(" "));
-  }
+  for (let i = 0; i <= words.length - n; i++) out.push(words.slice(i, i + n).join(" "));
   return out;
 }
 
 function isLowQuality(phrase, userWhitelist) {
   const words = phrase.toLowerCase().split(" ");
   if (words.length < 3) return true;
-  if (words.some((w) => DEFAULT_NAMES.has(w) || userWhitelist.has(w))) return true;
-  if (words.every((w) => COMMON_WORDS.has(w))) return true;
+  if (words.some(w => DEFAULT_NAMES.has(w) || userWhitelist.has(w))) return true;
+  if (words.every(w => COMMON_WORDS.has(w))) return true;
   return false;
 }
 
@@ -318,29 +346,18 @@ function getBlacklistWeight(phrase, blacklist) {
 
 // ── Core analysis ──────────────────────────────────────────
 
-/**
- * Analyze text and update a single charState pool.
- * @param {string} text
- * @param {object} charState  — { ngramFrequencies, totalMessages }
- * @param {object} config
- * @returns {object} updated charState
- */
 function analyzeText(text, charState, config) {
   const clean = stripMarkup(text);
   if (!clean.trim()) return charState;
 
-  const userWhitelist = new Set((config.whitelist || []).map((w) => w.toLowerCase()));
+  const userWhitelist = new Set((config.whitelist || []).map(w => w.toLowerCase()));
   const sentences = clean.match(/[^.!?]+[.!?]+["']?/g) || [clean];
 
   for (const sentence of sentences) {
     if (!sentence.trim()) continue;
     const isDialogue = /["']/.test(sentence.trim().substring(0, 10));
-    const words = sentence
-      .replace(/[.,!?]/g, "")
-      .toLowerCase()
-      .split(/\s+/)
-      .filter(Boolean);
-    const lemmas = words.map((w) => LEMMA_MAP.get(w) || w);
+    const words  = sentence.replace(/[.,!?]/g, "").toLowerCase().split(/\s+/).filter(Boolean);
+    const lemmas = words.map(w => LEMMA_MAP.get(w) || w);
 
     for (let n = 3; n <= config.ngramMax; n++) {
       if (words.length < n) continue;
@@ -352,14 +369,10 @@ function analyzeText(text, charState, config) {
         const lem  = lemNgrams[i];
         if (isLowQuality(orig, userWhitelist)) continue;
 
-        const cur = charState.ngramFrequencies[lem] || {
-          count: 0, score: 0, last: 0, original: orig,
-        };
-
+        const cur = charState.ngramFrequencies[lem] || { count: 0, score: 0, last: 0, original: orig };
         let inc = 1.0;
         inc += (n - 3) * 0.2;
-        const uncommon = orig.split(" ").filter((w) => !COMMON_WORDS.has(w)).length;
-        inc += uncommon * 0.5;
+        inc += orig.split(" ").filter(w => !COMMON_WORDS.has(w)).length * 0.5;
         inc += getBlacklistWeight(orig, config.blacklist || {});
         if (!isDialogue) inc *= 1.25;
 
@@ -374,11 +387,7 @@ function analyzeText(text, charState, config) {
   }
 
   charState.totalMessages++;
-
-  if (charState.totalMessages % config.decayInterval === 0) {
-    applyDecay(charState, config);
-  }
-
+  if (charState.totalMessages % config.decayInterval === 0) applyDecay(charState, config);
   return charState;
 }
 
@@ -395,25 +404,17 @@ function applyDecay(charState, config) {
 
 function buildSlopList(charState, config) {
   const entries = Object.values(charState.ngramFrequencies)
-    .filter((d) => d.score >= config.slopThreshold)
+    .filter(d => d.score >= config.slopThreshold)
     .sort((a, b) => b.score - a.score)
     .slice(0, 50);
 
   const kept = [];
   for (const entry of entries) {
-    const dominated = kept.some(
-      (k) => k.original.includes(entry.original) && k.score >= entry.score * 0.8,
-    );
+    const dominated = kept.some(k => k.original.includes(entry.original) && k.score >= entry.score * 0.8);
     if (!dominated) kept.push(entry);
   }
-
-  return kept.slice(0, config.maxInjected).map((e) => e.original);
+  return kept.slice(0, config.maxInjected).map(e => e.original);
 }
-
-// ── Pending state ──────────────────────────────────────────
-// Carries known char names from transformRequest → transformResponse.
-
-let _pending = null;
 
 // ── Pipeline hooks ─────────────────────────────────────────
 
@@ -421,25 +422,23 @@ function transformRequest(payload) {
   const config = loadConfig();
   if (!config.enabled || !config.injectSlop) return payload;
 
-  const state    = loadState();
-  const messages = payload.messages || [];
+  // Stash request ID for pending map
+  const reqId = payload._ppReqId ?? (payload._ppReqId = Math.random().toString(36).slice(2, 8));
 
-  // Build per-character style notes
-  const notes = [];
+  cleanupPending();
 
-  // Known characters from previous turns (stashed in _pending by last transformResponse)
-  const knownChars = _pending?.lastCharNames ?? [];
+  const state        = loadState();
+  const sessionChars = getSessionChars();
+  const notes        = [];
 
-  // Inject per-character notes (capped at maxCharsInjected)
-  const charsToInject = knownChars.slice(0, config.maxCharsInjected ?? 5);
+  // Per-character style notes (capped at maxCharsInjected)
+  const charsToInject = sessionChars.slice(0, config.maxCharsInjected ?? 5);
   for (const charName of charsToInject) {
     const charState = state.chars[charName];
     if (!charState) continue;
     const slopList = buildSlopList(charState, config);
     if (slopList.length > 0) {
-      notes.push(
-        `[Style note for ${charName}: avoid repeating — ${slopList.join("; ")}]`,
-      );
+      notes.push(`[Style note for ${charName}: avoid repeating — ${slopList.join("; ")}]`);
     }
   }
 
@@ -451,19 +450,18 @@ function transformRequest(payload) {
 
   if (notes.length === 0) return payload;
 
-  const note = notes.join("\n");
-
-  // Inject into the last system message
-  const lastSys = [...messages].reverse().find((m) => m.role === "system");
-  if (lastSys) {
-    if (Array.isArray(lastSys.content)) {
-      lastSys.content.push({ type: "text", text: note });
-    } else {
-      lastSys.content = (lastSys.content || "") + "\n\n" + note;
+  const note     = notes.join("\n");
+  const messages = (payload.messages || []).map(m => {
+    if (m.role !== "system") return m;
+    if (Array.isArray(m.content)) {
+      return { ...m, content: [...m.content, { type: "text", text: note }] };
     }
-  } else {
-    messages.unshift({ role: "system", content: note });
-  }
+    return { ...m, content: (m.content || "") + "\n\n" + note };
+  });
+
+  // If no system message exists, prepend one
+  const hasSys = messages.some(m => m.role === "system");
+  if (!hasSys) messages.unshift({ role: "system", content: note });
 
   return { ...payload, messages };
 }
@@ -476,47 +474,36 @@ function transformResponse(responseBody) {
     responseBody?.choices?.[0]?.message?.content ??
     responseBody?.content?.[0]?.text ??
     null;
-
   if (typeof text !== "string") return responseBody;
 
-  const state = loadState();
-
-  // Extract all character names from this reply
+  // Load state once for this response
+  const state     = loadState();
   const charNames = extractAllCharNames(text, null);
 
   if (charNames.length > 0) {
     console.log(`[prose-polisher] Analyzing reply for: ${charNames.join(", ")}`);
-
-    // Analyze text once per character found in this reply
     for (const charName of charNames) {
       if (!state.chars[charName]) {
         state.chars[charName] = freshCharState();
-        console.log(`[prose-polisher] New character pool created: ${charName}`);
+        console.log(`[prose-polisher] New character pool: ${charName}`);
       }
       state.chars[charName] = analyzeText(text, state.chars[charName], config);
     }
+    addSessionChars(charNames);
   } else {
     console.log("[prose-polisher] No character names found — analyzing into global pool");
   }
 
-  // Always analyze into global pool for scene-level tracking
+  // Always update global pool
   state.global = analyzeText(text, state.global, config);
-
   saveState(state);
-
-  // Stash char names for next transformRequest
-  _pending = {
-    lastCharNames: [
-      ...new Set([...(_pending?.lastCharNames ?? []), ...charNames]),
-    ],
-  };
 
   return responseBody;
 }
 
 module.exports = {
   name:              "Prose Polisher",
-  version:           "2.0",
+  version:           "2.1",
   priority:          40,
   transformRequest,
   transformResponse,

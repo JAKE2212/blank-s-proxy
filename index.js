@@ -127,6 +127,13 @@ app.use("/v1", (req, res, next) => {
   next();
 });
 
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rec] of rateLimitMap) {
+    if (now - rec.start > RATE_LIMIT_WINDOW_MS) rateLimitMap.delete(ip);
+  }
+}, RATE_LIMIT_WINDOW_MS);
+
 // ── Mount extension routes ─────────────────────────────────
 // Each extension's router is mounted at /extensions/<name>
 for (const ext of extensions) {
@@ -178,6 +185,8 @@ function rotateLogs() {
   }
 }
 
+setInterval(rotateLogs, 5 * 60 * 1000); // check every 5 minutes
+
 // ── Sensitive content masking ──────────────────────────
 const MASK_PATTERNS = [
   /sk-[a-zA-Z0-9\-]{10,}/g, // OpenAI/OpenRouter style keys
@@ -194,13 +203,14 @@ function maskSensitive(str) {
 }
 
 function writeLog(entry) {
-  rotateLogs();
   const raw =
     typeof entry === "string"
       ? `{"timestamp":"${new Date().toISOString()}","message":${JSON.stringify(entry)}}`
       : JSON.stringify({ timestamp: new Date().toISOString(), ...entry });
   const line = maskSensitive(raw) + "\n";
-  fs.appendFileSync(LOG_FILE, line, "utf8");
+  fs.appendFile(LOG_FILE, line, "utf8", (err) => {
+    if (err) console.error("[proxy] Failed to write log:", err.message);
+  });
   console.log(
     typeof entry === "string" ? entry : "[proxy]" + JSON.stringify(entry),
   );
@@ -224,11 +234,7 @@ function genRequestId() {
 
 // ── Model name normalization ───────────────────────────────
 function normalizeModel(model) {
-  return (model ?? "")
-    .replace(/^anthropic\//, "")
-    .replace(/^openai\//, "")
-    .replace(/^google\//, "")
-    .replace(/^meta-llama\//, "");
+  return (model ?? "").replace(/^[a-z-]+\//, "");
 }
 
 // ── Helper: send request to OpenRouter with retry logic ────
@@ -425,11 +431,10 @@ app.post("/v1/chat/completions", async (req, res) => {
       }
     }
 
-    const tvInstance = extensions.find((e) => e.filename === "tunnelvision.js");
     let result;
     try {
-      result = tvInstance?.wrapSendWithToolLoop
-        ? await tvInstance.wrapSendWithToolLoop(
+      result = tvExt?.wrapSendWithToolLoop
+        ? await tvExt.wrapSendWithToolLoop(
             transformedPayload,
             sendToOpenRouter,
           )
@@ -454,20 +459,6 @@ app.post("/v1/chat/completions", async (req, res) => {
       return res.status(result.status).json(result.error);
     }
 
-    // ── Log token usage ────────────────────────────────────
-    const usage = result.data?.usage;
-    const reply = result.data?.choices?.[0]?.message?.content;
-    writeLog({
-      event: "bot",
-      requestId,
-      model: normalizeModel(model),
-      prompt_tokens: usage?.prompt_tokens,
-      completion_tokens: usage?.completion_tokens,
-      total_tokens: usage?.total_tokens,
-      cache_read: usage?.prompt_tokens_details?.cached_tokens,
-      char: typeof reply === "string" ? reply.slice(0, 300) : null,
-    });
-
     // ── Truncation warning ─────────────────────────────────
     const stopReason = result.data?.choices?.[0]?.finish_reason;
     if (stopReason === "length") {
@@ -477,20 +468,6 @@ app.post("/v1/chat/completions", async (req, res) => {
         message: `[proxy] ⚠ Response truncated at token limit — model: ${normalizeModel(model)}`,
       });
     }
-
-    // ── Duplicate response detection ───────────────────────
-    if (lastReply && reply && typeof reply === "string") {
-      const overlap = [...reply].filter((c, i) => lastReply[i] === c).length;
-      const similarity = overlap / Math.max(reply.length, lastReply.length);
-      if (similarity > 0.9) {
-        writeLog({
-          event: "system",
-          requestId,
-          message: `[proxy] ⚠ Possible looping response detected — ${Math.round(similarity * 100)}% similar to last reply`,
-        });
-      }
-    }
-    lastReply = reply ?? null;
 
     // ── Run transformResponse pipeline ─────────────────────
     let finalData = result.data;
@@ -507,6 +484,38 @@ app.post("/v1/chat/completions", async (req, res) => {
         }
       }
     }
+
+    // ── Log token usage (post-transform) ───────────────────
+    const usage = result.data?.usage;
+    const finalReply = finalData?.choices?.[0]?.message?.content;
+    writeLog({
+      event: "bot",
+      requestId,
+      model: normalizeModel(model),
+      prompt_tokens: usage?.prompt_tokens,
+      completion_tokens: usage?.completion_tokens,
+      total_tokens: usage?.total_tokens,
+      cache_read: usage?.prompt_tokens_details?.cached_tokens,
+      char: typeof finalReply === "string" ? finalReply.slice(0, 300) : null,
+    });
+
+    // ── Duplicate response detection ───────────────────────
+    if (lastReply && finalReply && typeof finalReply === "string") {
+      const len = Math.min(finalReply.length, lastReply.length);
+      let matches = 0;
+      for (let i = 0; i < len; i++) {
+        if (finalReply[i] === lastReply[i]) matches++;
+      }
+      const similarity = matches / Math.max(finalReply.length, lastReply.length);
+      if (similarity > 0.9) {
+        writeLog({
+          event: "system",
+          requestId,
+          message: `[proxy] ⚠ Possible looping response detected — ${Math.round(similarity * 100)}% similar to last reply`,
+        });
+      }
+    }
+    lastReply = finalReply ?? null;
 
     done();
     res.json(finalData);
@@ -604,7 +613,7 @@ const server = app.listen(PORT, () => {
       .filter(Boolean)
       .join(", ");
     console.log(
-      `[proxy]   · ${ext.name ?? ext.name} v${ext.version ?? "?"} (priority ${ext.priority ?? 50}) — ${hooks}`,
+      `[proxy]   · ${ext.name ?? ext.filename} v${ext.version ?? "?"} (priority ${ext.priority ?? 50}) — ${hooks}`,
     );
   }
   console.log(`[proxy] ${line}`);
