@@ -1,3 +1,4 @@
+"use strict" 
 // ============================================================
 // extensions/ooc.js — Out-of-character command handler
 // Detects (OOC: ...) in the last user message, strips it from
@@ -12,10 +13,7 @@ function transformRequest(payload) {
   if (!Array.isArray(messages) || messages.length === 0) return payload;
 
   // Find the last user message
-  const lastUserIdx = messages.reduce(
-    (found, msg, i) => (msg.role === "user" ? i : found),
-    -1,
-  );
+  const lastUserIdx = messages.findLastIndex((m) => m.role === "user");
   if (lastUserIdx === -1) return payload;
 
   const lastUser = messages[lastUserIdx];
