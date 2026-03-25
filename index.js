@@ -8,7 +8,7 @@ const dotenv = require("dotenv");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
-const { isClaudeModel, applyPromptCaching } = require("./lib/prompt-cache");
+const { applyPromptCaching } = require("./lib/prompt-cache");
 const { enqueue, getStats: getQueueStats } = require("./lib/queue");
 const {
   callWithBreaker,
