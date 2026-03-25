@@ -9,11 +9,8 @@ let rxScripts = [], rxEditingId = null;
 // ── Fetch & render ─────────────────────────────────────────
 async function fetchRegexScripts() {
   try {
-    const [scriptsRes, countersRes] = await Promise.all([
-      fetch('/extensions/regex/scripts').then(r => r.json()),
-      fetch('/extensions/regex/counters').then(r => r.json()),
-    ]);
-    rxScripts = scriptsRes.scripts ?? [];
+    const data = await fetch('/extensions/regex/scripts').then(r => r.json());
+    rxScripts = data.scripts ?? [];
     renderRegexScripts();
   } catch {
     document.getElementById('regex-script-list').innerHTML =
@@ -26,48 +23,52 @@ function renderRegexScripts() {
 
   // ── Group summary bar ──────────────────────────────────
   const allTags = [...new Set(rxScripts.flatMap(s => s.tags ?? []))];
-  const groupBar = allTags.length ? `
-    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:0.8rem;align-items:center;">
+  let groupBarHtml = '';
+  if (allTags.length) {
+    const tagPills = allTags.map(tag => {
+      const safeTag = esc(tag);
+      return `<span style="display:inline-flex;gap:4px;align-items:center;background:rgba(60,140,240,0.1);border:1px solid rgba(60,140,240,0.25);border-radius:99px;padding:2px 8px;">
+        <span style="font-size:0.71rem;font-weight:800;color:#0d3a8a;">${safeTag}</span>
+        <button class="btn" style="font-size:0.62rem;padding:1px 6px;" onclick="rxGroupToggle(${JSON.stringify(tag)}, true)">on</button>
+        <button class="btn danger" style="font-size:0.62rem;padding:1px 6px;" onclick="rxGroupToggle(${JSON.stringify(tag)}, false)">off</button>
+      </span>`;
+    }).join('');
+    groupBarHtml = `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:0.8rem;align-items:center;">
       <span style="font-size:0.7rem;font-weight:800;color:#3a6a88;text-transform:uppercase;letter-spacing:0.7px;">Groups:</span>
-      ${allTags.map(tag => `
-        <span style="display:inline-flex;gap:4px;align-items:center;background:rgba(60,140,240,0.1);border:1px solid rgba(60,140,240,0.25);border-radius:99px;padding:2px 8px;">
-          <span style="font-size:0.71rem;font-weight:800;color:#0d3a8a;">${esc(tag)}</span>
-          <button onclick="rxGroupToggle('${esc(tag)}',true)"  style="font-size:0.62rem;font-weight:800;color:#0a6a4a;background:none;border:none;cursor:pointer;padding:0 2px;">on</button>
-          <span style="color:#aaa;font-size:0.6rem;">|</span>
-          <button onclick="rxGroupToggle('${esc(tag)}',false)" style="font-size:0.62rem;font-weight:800;color:#7a1010;background:none;border:none;cursor:pointer;padding:0 2px;">off</button>
-        </span>`).join('')}
+      ${tagPills}
       <button class="btn" onclick="rxResetCounters()" style="font-size:0.7rem;margin-left:auto;">↺ Reset Counters</button>
-    </div>` : '';
+    </div>`;
+  }
 
   if (!rxScripts.length) {
-    el.innerHTML = groupBar + '<div class="empty-state" style="padding:2rem 1rem;">No scripts yet. Click <strong>+ New Script</strong> to add one.</div>';
+    el.innerHTML = groupBarHtml + '<div class="empty-state" style="padding:2rem 1rem;">No scripts yet. Click <strong>+ New Script</strong> to add one.</div>';
     return;
   }
 
-  el.innerHTML = groupBar;
+  el.innerHTML = groupBarHtml;
+
   rxScripts.forEach(s => {
     const card = document.createElement('div');
     card.className = 'rx-script-card' + (s.enabled ? '' : ' disabled');
 
-    const hits = s.hits ?? 0;
+    const hits     = s.hits ?? 0;
     const hitBadge = hits > 0
       ? `<span style="font-size:0.62rem;font-weight:800;color:#0a6a4a;background:rgba(13,158,110,0.12);border:1px solid rgba(13,158,110,0.3);border-radius:99px;padding:2px 7px;">↯ ${hits}</span>`
       : '';
-
     const stopBadge = s.stopOnMatch
       ? `<span style="font-size:0.62rem;font-weight:800;color:#7a4a00;background:rgba(255,160,0,0.12);border:1px solid rgba(255,160,0,0.3);border-radius:99px;padding:2px 7px;">⊠ stop</span>`
       : '';
-
     const dryBadge = s.dryRun
       ? `<span style="font-size:0.62rem;font-weight:800;color:#4a0a8a;background:rgba(140,100,240,0.12);border:1px solid rgba(140,100,240,0.3);border-radius:99px;padding:2px 7px;">◎ dry</span>`
       : '';
-
     const tagBadges = (s.tags ?? []).map(t =>
       `<span style="font-size:0.6rem;font-weight:700;color:#0d3a8a;background:rgba(60,140,240,0.1);border:1px solid rgba(60,140,240,0.22);border-radius:99px;padding:1px 6px;">${esc(t)}</span>`
     ).join('');
 
+    const safeId = esc(s.id);
+
     card.innerHTML = `
-      <button class="rx-toggle ${s.enabled ? 'on' : ''}" title="Toggle" onclick="rxToggle('${s.id}')"></button>
+      <button class="rx-toggle ${s.enabled ? 'on' : ''}" title="Toggle" onclick="rxToggle(${JSON.stringify(s.id)})"></button>
       <div class="rx-script-info">
         <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-bottom:3px;">
           <span class="rx-script-name">${esc(s.description || 'Untitled')}</span>
@@ -78,7 +79,7 @@ function renderRegexScripts() {
           ${s.trimStrings ? ' · trim' : ''}
         </div>
       </div>
-      <button class="rx-edit-btn" onclick="openScriptModal('${s.id}')">✏ Edit</button>`;
+      <button class="rx-edit-btn" onclick="openScriptModal(${JSON.stringify(s.id)})">✏ Edit</button>`;
     el.appendChild(card);
   });
 }
@@ -113,18 +114,18 @@ async function rxResetCounters() {
 function openScriptModal(id) {
   rxEditingId = id;
   const s = id ? rxScripts.find(x => x.id === id) : null;
-  document.getElementById('script-modal-title').textContent = s ? 'Edit Script' : 'New Script';
-  document.getElementById('sm-desc').value      = s?.description   ?? '';
-  document.getElementById('sm-find').value      = s?.findRegex     ?? '';
-  document.getElementById('sm-replace').value   = s?.replaceString ?? '';
-  document.getElementById('sm-flags').value     = s?.flags         ?? 'g';
-  document.getElementById('sm-trim').checked      = s?.trimStrings  ?? false;
-  document.getElementById('sm-enabled').checked   = s?.enabled      ?? true;
-  document.getElementById('sm-stop').checked      = s?.stopOnMatch  ?? false;
-  document.getElementById('sm-dryrun').checked    = s?.dryRun       ?? false;
-  document.getElementById('sm-tags').value        = (s?.tags ?? []).join(', ');
-  document.getElementById('sm-error').style.display = 'none';
-  document.getElementById('sm-delete-btn').style.display = s ? 'inline-flex' : 'none';
+  document.getElementById('script-modal-title').textContent  = s ? 'Edit Script' : 'New Script';
+  document.getElementById('sm-desc').value                   = s?.description   ?? '';
+  document.getElementById('sm-find').value                   = s?.findRegex     ?? '';
+  document.getElementById('sm-replace').value                = s?.replaceString ?? '';
+  document.getElementById('sm-flags').value                  = s?.flags         ?? 'g';
+  document.getElementById('sm-trim').checked                 = s?.trimStrings   ?? false;
+  document.getElementById('sm-enabled').checked              = s?.enabled       ?? true;
+  document.getElementById('sm-stop').checked                 = s?.stopOnMatch   ?? false;
+  document.getElementById('sm-dryrun').checked               = s?.dryRun        ?? false;
+  document.getElementById('sm-tags').value                   = (s?.tags ?? []).join(', ');
+  document.getElementById('sm-error').style.display          = 'none';
+  document.getElementById('sm-delete-btn').style.display     = s ? 'inline-flex' : 'none';
   document.getElementById('script-modal').classList.add('open');
 }
 
