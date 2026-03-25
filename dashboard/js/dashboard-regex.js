@@ -184,7 +184,7 @@ function showSmError(msg) {
 }
 
 async function deleteScriptFromModal() {
-  if (!rxEditingId || !confirm('Delete this script?')) return;
+  if (!rxEditingId || !await showConfirm('Delete this script?')) return;
   await fetch(`/extensions/regex/scripts/${rxEditingId}`, { method: 'DELETE' });
   closeScriptModalDirect();
   await fetchRegexScripts();

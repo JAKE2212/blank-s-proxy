@@ -21,6 +21,22 @@
   </div>
 </div>
 
+<!-- Confirm modal -->
+<div class="modal-overlay" id="confirm-modal">
+  <div class="modal-box" style="max-width:380px;">
+    <div class="modal-head">
+      <span class="modal-title">Confirm</span>
+    </div>
+    <div class="modal-body" style="padding:1.2rem 1.3rem;">
+      <p id="confirm-message" style="font-size:0.88rem;font-weight:600;color:#0d2a3a;margin-bottom:1.2rem;"></p>
+      <div style="display:flex;justify-content:flex-end;gap:8px;">
+        <button class="btn" id="confirm-cancel">Cancel</button>
+        <button class="btn danger" id="confirm-ok">Confirm</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Script editor modal -->
 <div class="modal-overlay" id="script-modal" onclick="closeScriptModal(event)">
   <div class="modal-box" style="max-width:520px;">
