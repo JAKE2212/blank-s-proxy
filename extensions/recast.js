@@ -368,6 +368,7 @@ async function callOpenRouter(systemPrompt, userContent, model, maxTokens) {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     },
+    signal: AbortSignal.timeout(30_000),
     body: JSON.stringify({
       model,
       max_tokens: maxTokens,
