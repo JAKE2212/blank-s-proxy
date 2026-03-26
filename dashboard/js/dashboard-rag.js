@@ -28,7 +28,7 @@ async function fetchRagStatus() {
     btn.textContent = enabled ? '✓ Enabled — Click to Disable' : '✗ Disabled — Click to Enable';
     btn.className   = enabled ? 'btn' : 'btn danger';
 
-    document.getElementById('rag-stat-char').textContent    = s.lastInjectionChar !== 'none' ? s.lastInjectionChar : '—';
+    document.getElementById('rag-stat-char').textContent    = s.lastActiveChars?.length ? s.lastActiveChars.join(', ') : '—';
     document.getElementById('rag-stat-chars').textContent   = s.lastInjectionChars || '0';
     document.getElementById('rag-stat-msg').textContent     = s.lastInjectionMsg   || '—';
     document.getElementById('rag-stat-total').textContent   = s.totalInjections    || '0';

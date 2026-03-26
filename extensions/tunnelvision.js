@@ -132,11 +132,6 @@ function extractToolCalls(responseData) {
   return [];
 }
 
-/**
- * Check if the response is a tool call (finish_reason === "tool_calls").
- * @param {object} responseData
- * @returns {boolean}
- */
 // ── Tool call loop ────────────────────────────────────────────────────────────
 
 /**
@@ -267,6 +262,9 @@ router.get("/status", (req, res) => {
     activeName: active,
     treeExists: !!tree,
     nodeCount: tree ? Object.keys(tree.nodes).length : 0,
+    entryCount: tree
+      ? Object.values(tree.nodes).reduce((s, n) => s + (n.entries?.filter(e => e.enabled !== false).length ?? 0), 0)
+      : 0,
     trees,
   });
 });

@@ -207,7 +207,7 @@ function toggleEntry(id) {
 }
 
 async function clearLogs() {
-  if (!confirm("Clear all logs?")) return;
+  if (!await showConfirm("Clear all logs?")) return;
   await fetch("/dashboard/logs", { method: "DELETE" });
   allLogs = [];
   renderLogs();
