@@ -93,11 +93,11 @@ This tag will be automatically stripped before the user sees it — do not menti
  */
 function extractEmotion(text) {
   if (!text) return { emotion: "neutral", cleanText: text };
-  const match = text.match(/^<emotion>([a-z]+)<\/emotion>\s*/i);
+  const match = text.match(/^\s*<emotion>([a-z]+)<\/emotion>\s*/i);
   if (!match) return { emotion: "neutral", cleanText: text };
   const label = match[1].toLowerCase();
   const emotion = VALID_EMOTIONS.has(label) ? label : "neutral";
-  const cleanText = text.slice(match[0].length);
+  const cleanText = text.slice(0, match.index) + text.slice(match.index + match[0].length);
   return { emotion, cleanText };
 }
 
