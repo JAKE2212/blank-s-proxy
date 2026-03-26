@@ -129,7 +129,7 @@ POST /v1/chat/completions
 ```js
 START_TIME       // server start timestamp
 lastRequestTime  // ISO string of last request
-lastReply        // last AI reply text (for duplicate detection)
+lastReply        // it now compares post-transform text.
 RESTART_HISTORY  // array of { time, reason } restart records
 ```
 
@@ -143,6 +143,10 @@ RESTART_HISTORY  // array of { time, reason } restart records
 - If `primeTreeName` crashes, TunnelVision won't work for that request
 - If the dashboard bundle fails to build, the old bundle is used (non-fatal)
 - Memory monitoring uses `setInterval(30s)` — a spike between checks won't trigger restart
+- `rateLimitMap` is cleaned up every 60s via setInterval — stale entries are pruned automatically
+- Bot log and duplicate detection now run after `transformResponse` — logs show final post-transform text
+- Log rotation runs on a 5-minute interval, not per-write
+- File writes to the log are async (non-blocking)
 
 ---
 
@@ -268,7 +272,7 @@ EMBEDDING_DIM                // 1024
 
 **What can go wrong:**
 - If Ollama container (192.168.1.193) is down, all RAG operations fail silently (logged as warnings, non-fatal)
-- Uses `import("node-fetch")` dynamic import — if `node-fetch` isn't installed, this throws
+- Uses Node.js native `fetch` (Node 18+)
 - Ollama `/api/embed` returns `{ embeddings: [[...]] }` — if the shape changes, the extractor breaks
 
 ---
@@ -422,10 +426,10 @@ Handles out-of-character (OOC) messages from JanitorAI. Strips or routes OOC con
 **Routes:** See `EXTENSIONS.md` for full route reference.
 
 **What can go wrong:**
-- Scripts are loaded from disk on every response — no caching
-- An invalid regex silently returns the original text unchanged
+- Scripts are cached in memory with a dirty flag — disk reads only happen on first load
+- Invalid regexes are rejected at creation/update/import time with a 400 error. If a script somehow has an invalid regex at runtime, it silently returns the original text unchanged.
 - Scripts run in order — a script that modifies text can affect subsequent scripts
-- `transformResponse` mutates `responseBody` in-place for the `choices[0]` path (not a pure function)
+- `transformResponse` returns a new object — never mutates the original response body
 
 ---
 
@@ -437,15 +441,20 @@ Handles out-of-character (OOC) messages from JanitorAI. Strips or routes OOC con
 
 **State carried between hooks:**
 ```js
-_pending = {
-  userText,      // last user message (for indexing)
-  msgCount,      // message count (for decay calculation)
-  lastCharName,  // character name from previous turn
+// Per-request state (transformRequest → transformResponse)
+_pendingMap = Map<reqId, {
+  userText,    // last user message (for indexing)
+  msgCount,    // message count (for decay calculation)
+  userName,    // user's name (for pronoun blocklisting)
+  isReroll,    // true if same user message as last turn
+}>
+
+// Cross-turn state (persists across requests)
+_turnState = {
+  lastCharNames, // accumulated character names from all turns
   lastEmotion,   // emotion from previous turn
-  userName,      // user's name (for pronoun blocklisting)
-  isReroll,      // true if same user message as last turn
+  lastUserText,  // for reroll detection
 }
-_lastUserText    // persists across turns for reroll detection
 ```
 
 **Emotion flow:**
@@ -461,7 +470,8 @@ _lastUserText    // persists across turns for reroll detection
 - Names are sanitized for Qdrant collection naming
 
 **What can go wrong:**
-- `_pending` is a module-level variable — concurrent requests will overwrite each other's state
+- Cross-turn state (`_turnState`) is still module-level — concurrent sessions with different characters would share accumulated names. Single-user usage avoids this.
+- Per-request state uses `_pendingMap` with TTL cleanup — concurrent requests no longer overwrite each other's indexing data.
 - Character name extraction relies on the AI starting sentences with the character's name — may fail for first-person narration
 - If Ollama is slow, `transformRequest` blocks the entire request pipeline while waiting for the embedding
 - `blindNextTurn` flag is written to disk and reset after use — if the proxy crashes between the write and the reset, it stays true permanently
@@ -481,9 +491,9 @@ _lastUserText    // persists across turns for reroll detection
 
 **Merge behavior:**
 ```js
-return { ...params, ...payload };
+return { ...payload, ...params };
 ```
-JanitorAI's own params always win over saved sampler settings.
+Configured sampler values override JanitorAI defaults. Disable a sampler in the dashboard to let JanitorAI's value through.
 
 **What can go wrong:**
 - Config is loaded from disk on every request — no caching
@@ -550,13 +560,15 @@ JanitorAI's own params always win over saved sampler settings.
 **State:**
 ```js
 _pendingTreeName  // module-level, set by primeTreeName, used by wrapSendWithToolLoop
+_pendingTreeName  // set by primeTreeName, used by transformRequest + wrapSendWithToolLoop
+_pendingTree      // cached tree reference, avoids redundant disk reads
+_configCache      // config cached in memory, invalidated on save
 ```
 
 **What can go wrong:**
 - `_pendingTreeName` is module-level — concurrent requests overwrite each other (same problem as RAG's `_pending`)
 - If `primeTreeName` doesn't find a `<BotName's Persona>` tag, TunnelVision won't activate for that request
 - The tool loop appends to `messages` on each round — very deep tool call chains create long context
-- `transformResponse` is a no-op — cleanup happens inside `runToolLoop`, not the standard pipeline
 
 ---
 
@@ -835,7 +847,9 @@ _tvEditorNodeId  // node ID for add-entry modal context
 - Remember `transformResponse` runs AFTER TunnelVision strips its tags
 
 **Concurrent request issues (wrong character names, wrong tree)**
-- `_pending` in rag.js, tunnelvision.js, and recast.js are all module-level
+- rag.js uses `_pendingMap` for per-request state (safe) but `_turnState` for cross-turn state (shared)
+- tunnelvision.js uses `_pendingTreeName` and `_pendingTree` which are module-level
+- recast.js uses `_pending` which is module-level (documented as single-user safe)
 - If two roleplay sessions run simultaneously, they share state
 - The queue (`MAX_CONCURRENT = 3`) reduces but doesn't eliminate this
 - Workaround: reduce `MAX_CONCURRENT` to 1 in `lib/queue.js`

@@ -284,6 +284,9 @@ SillyTavern-compatible regex post-processor. Runs an ordered list of find/replac
   flags:         string,   // regex flags e.g. 'g', 'gi'
   trimStrings:   boolean,  // trim whitespace from result
   enabled:       boolean,
+  stopOnMatch:   boolean,  // stop chain when this script fires
+  dryRun:        boolean,  // log matches without applying
+  tags:          string[], // group tags for bulk enable/disable
 }
 ```
 
@@ -300,6 +303,10 @@ SillyTavern-compatible regex post-processor. Runs an ordered list of find/replac
 | `POST`   | `/test-all`         | Run all enabled scripts against input |
 | `POST`   | `/import`           | Import array of scripts (ST JSON compatible) |
 | `GET`    | `/export`           | Download scripts as JSON file |
+| `POST`   | `/group/:tag/enable`  | Bulk enable all scripts with tag |
+| `POST`   | `/group/:tag/disable` | Bulk disable all scripts with tag |
+| `GET`    | `/counters`           | Live per-script hit counts |
+| `POST`   | `/counters/reset`     | Reset all hit counters |
 
 ---
 
@@ -352,7 +359,7 @@ Scoring pipeline: cosine similarity → temporal decay → keyword boost → emo
 
 ### tunnelvision.js
 
-**Priority:** 26 | **Hooks:** `transformRequest`, `transformResponse` | **Routes:** `/extensions/tunnelvision/*`
+**Priority:** 26 | **Hooks:** `transformRequest` | **Routes:** `/extensions/tunnelvision/*`
 
 Hierarchical lorebook memory via real Claude tool calls. Maintains a tree of knowledge nodes (channels) and entries per bot character. Claude can search, read, create, and update entries during generation via a tool loop (up to 6 rounds per request).
 
@@ -384,12 +391,14 @@ Model-aware sampler controls. Applies enabled sampler parameters (Top P, Top K, 
 ```js
 // Config shape — keyed by model string
 {
-  "anthropic/claude-opus-4-5": {
-    top_p: { enabled: boolean, value: number },
-    top_k: { enabled: boolean, value: number },
-  },
-  // ...other models
+  top_p:              { enabled: boolean, value: number },
+  top_k:              { enabled: boolean, value: number },
+  min_p:              { enabled: boolean, value: number },
+  presence_penalty:   { enabled: boolean, value: number },
+  frequency_penalty:  { enabled: boolean, value: number },
+  repetition_penalty: { enabled: boolean, value: number },
 }
+```
 ```
 
 **Routes:**
