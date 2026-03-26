@@ -49,9 +49,12 @@ function loadConfig() {
 
 // ── State persistence ──────────────────────────────────────
 
+let _stateCache = null;
+
 function loadState() {
+  if (_stateCache) return _stateCache;
   try {
-    if (!fs.existsSync(STATE_FILE)) return freshState();
+    if (!fs.existsSync(STATE_FILE)) { _stateCache = freshState(); return _stateCache; }
     const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
 
     // ── Migration: old flat format → per-character format ──
@@ -68,9 +71,11 @@ function loadState() {
 
     if (!raw.chars)  raw.chars  = {};
     if (!raw.global) raw.global = freshCharState();
-    return raw;
+    _stateCache = raw;
+    return _stateCache;
   } catch {
-    return freshState();
+    _stateCache = freshState();
+    return _stateCache;
   }
 }
 
@@ -83,18 +88,13 @@ function freshState() {
 }
 
 function saveState(state) {
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state), "utf8");
-  } catch (e) {
-    console.warn("[prose-polisher] Failed to save state:", e.message);
-  }
+  _stateCache = state;
+  fs.writeFile(STATE_FILE, JSON.stringify(state), "utf8", (err) => {
+    if (err) console.warn("[prose-polisher] Failed to save state:", err.message);
+  });
 }
 
-// ── Per-request pending state ──────────────────────────────
-// Keyed by a request ID to avoid concurrent request collisions.
-// Each entry: { charNames: string[], timestamp: number }
-const _pendingMap = new Map();
-const PENDING_TTL_MS = 5 * 60 * 1000; // 5 minutes — auto-expire stale entries
+
 
 // Session char name accumulator — resets when no activity for 30 minutes
 let _sessionChars    = [];
@@ -115,12 +115,6 @@ function addSessionChars(names) {
   _sessionChars = [...new Set([..._sessionChars, ...names])].slice(0, 20);
 }
 
-function cleanupPending() {
-  const now = Date.now();
-  for (const [key, val] of _pendingMap.entries()) {
-    if (now - val.timestamp > PENDING_TTL_MS) _pendingMap.delete(key);
-  }
-}
 
 // ── Character name extraction ──────────────────────────────
 
@@ -421,11 +415,6 @@ function buildSlopList(charState, config) {
 function transformRequest(payload) {
   const config = loadConfig();
   if (!config.enabled || !config.injectSlop) return payload;
-
-  // Stash request ID for pending map
-  const reqId = payload._ppReqId ?? (payload._ppReqId = Math.random().toString(36).slice(2, 8));
-
-  cleanupPending();
 
   const state        = loadState();
   const sessionChars = getSessionChars();

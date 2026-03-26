@@ -1,3 +1,4 @@
+"use strict";
 // ============================================================
 // extensions/samplers.js — Sampler Settings Extension
 // Injects sampler parameters into outgoing requests.
@@ -103,18 +104,18 @@ function buildDefaults() {
   }
   return defaults;
 }
+let _configCache = null;
 
-// ── Load config from disk ──────────────────────────────────
 function loadConfig() {
+  if (_configCache) return _configCache;
   try {
-    if (!fs.existsSync(CONFIG_FILE)) return buildDefaults();
-    return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+    if (!fs.existsSync(CONFIG_FILE)) { _configCache = buildDefaults(); return _configCache; }
+    _configCache = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+    return _configCache;
   } catch (e) {
-    console.warn(
-      "[samplers] Failed to load config, using defaults:",
-      e.message,
-    );
-    return buildDefaults();
+    console.warn("[samplers] Failed to load config, using defaults:", e.message);
+    _configCache = buildDefaults();
+    return _configCache;
   }
 }
 
@@ -124,6 +125,7 @@ function saveConfig(config) {
     const dir = path.dirname(CONFIG_FILE);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), "utf8");
+    _configCache = null;
   } catch (e) {
     console.warn("[samplers] Failed to save config:", e.message);
   }
@@ -191,8 +193,8 @@ function transformRequest(payload) {
     params[key] = setting.value;
   }
 
-  // Merge — payload values (from JanitorAI) always win
-  return { ...params, ...payload };
+  // Merge — configured sampler values override payload defaults
+  return { ...payload, ...params };
 }
 
 // ── Export ─────────────────────────────────────────────────

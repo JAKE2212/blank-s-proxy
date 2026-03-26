@@ -253,15 +253,19 @@ RESPONSE TO FIX:
 
 // ── Pending context (stashed in transformRequest, used in transformResponse) ───
 
+// Per-request context (transformRequest → transformResponse)
+// Single-slot — safe for single-user, would need a map for concurrent requests
 let _pending = null;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
+let _configCache = null;
+
 function loadConfig() {
+  if (_configCache) return _configCache;
   try {
     if (fs.existsSync(CONFIG_PATH)) {
       const saved = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
-      // Deep merge steps so new keys survive updates
       const merged = { ...DEFAULT_CONFIG, ...saved };
       merged.steps = { ...DEFAULT_CONFIG.steps, ...(saved.steps || {}) };
       for (const k of Object.keys(DEFAULT_CONFIG.steps)) {
@@ -270,17 +274,20 @@ function loadConfig() {
           ...(merged.steps[k] || {}),
         };
       }
-      return merged;
+      _configCache = merged;
+      return _configCache;
     }
   } catch (e) {
     console.warn("[recast] Failed to load config:", e.message);
   }
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULT_CONFIG, null, 2));
-  return { ...DEFAULT_CONFIG };
+  _configCache = { ...DEFAULT_CONFIG };
+  return _configCache;
 }
 
 function saveConfig(cfg) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+  _configCache = null;
 }
 
 /** Extract the longest system message (the original character card prompt). */
@@ -341,7 +348,7 @@ function extractRecentMessages(messages, n = 6) {
             ? m.content.map((b) => b.text || "").join("")
             : "";
       // Strip JanitorAI SYSTEM NOTEs appended to user messages
-      const clean = content.replace(/\nSYSTEM NOTE:[\s\S]*/gi, "").trim();
+      const clean = content.replace(/\nSYSTEM NOTE:[^\n]*/gi, "").trim();
       return `[${m.role.toUpperCase()}]: ${clean}`;
     });
   return turns.slice(-n).join("\n\n");
@@ -545,8 +552,13 @@ async function transformResponse(data) {
   }
 
   // Write final reply back
-  data.choices[0].message.content = reply;
-  return data;
+    if (reply === originalReply) return data;
+    return {
+      ...data,
+      choices: data.choices.map((c, i) =>
+        i === 0 ? { ...c, message: { ...c.message, content: reply } } : c,
+      ),
+    };
 }
 
 // ── Routes ─────────────────────────────────────────────────────────────────────

@@ -21,6 +21,7 @@ const {
   listTrees,
   buildTreeOverview,
   addNode,
+  deleteTree,
 } = require("../lib/tunnelvision/tv-tree");
 
 const {
@@ -40,13 +41,14 @@ const DEFAULT_CONFIG = {
   maxContextChars: 3000, // cap on injected context length
 };
 
+let _configCache = null;
+
 function loadConfig() {
+  if (_configCache) return _configCache;
   try {
     if (fs.existsSync(CONFIG_PATH)) {
-      return {
-        ...DEFAULT_CONFIG,
-        ...JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")),
-      };
+      _configCache = { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) };
+      return _configCache;
     }
   } catch (e) {
     console.warn(
@@ -58,18 +60,19 @@ function loadConfig() {
     fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULT_CONFIG, null, 2));
   } catch {}
-  return { ...DEFAULT_CONFIG };
+  _configCache = { ...DEFAULT_CONFIG };
+  return _configCache;
 }
 
 function saveConfig(config) {
   try {
     fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+    _configCache = null;
   } catch (e) {
     console.warn("[tunnelvision] Failed to save config:", e.message);
   }
 }
-
 // ── Bot name extraction ───────────────────────────────────────────────────────
 
 /**
@@ -134,10 +137,6 @@ function extractToolCalls(responseData) {
  * @param {object} responseData
  * @returns {boolean}
  */
-function isToolCallResponse(responseData) {
-  return responseData?.choices?.[0]?.finish_reason === "tool_calls";
-}
-
 // ── Tool call loop ────────────────────────────────────────────────────────────
 
 /**
@@ -230,6 +229,7 @@ async function runToolLoop(payload, tree, sendFn) {
 
 // Carries the active tree name across request→response within the same turn
 let _pendingTreeName = null;
+let _pendingTree = null;
 
 // ── Tree priming ──────────────────────────────────────────────────────────────
 
@@ -245,7 +245,7 @@ function primeTreeName(messages) {
     config.activeTree ?? (config.autoDetect ? extractBotName(messages) : null);
   if (name) {
     _pendingTreeName = name;
-    getOrCreateTree(name);
+    _pendingTree = getOrCreateTree(name);
     console.log(`[tunnelvision] Primed tree: "${name}"`);
   }
 }
@@ -342,7 +342,6 @@ router.post("/config", (req, res) => {
 
 // DELETE /extensions/tunnelvision/tree/:name — delete a tree
 router.delete("/tree/:name", (req, res) => {
-  const { deleteTree } = require("../lib/tunnelvision/tv-tree");
   try {
     deleteTree(req.params.name);
     res.json({ ok: true, deleted: req.params.name });
@@ -384,6 +383,7 @@ async function transformRequest(payload) {
   // Load or create tree
   const tree = getOrCreateTree(treeName);
   _pendingTreeName = treeName;
+  _pendingTree = tree;
 
   console.log(
     `[tunnelvision] Active tree: "${treeName}" (${Object.keys(tree.nodes).length} nodes)`,
@@ -405,11 +405,6 @@ async function transformRequest(payload) {
  * main handler via our exported runToolLoop. This hook handles any
  * final cleanup (e.g. stripping tool metadata from the response).
  */
-async function transformResponse(data) {
-  // Nothing to strip — tool results are handled in-flight by runToolLoop
-  // and never reach the final response that JanitorAI sees.
-  return data;
-}
 
 // ── Tool loop integration ─────────────────────────────────────────────────────
 
@@ -431,7 +426,7 @@ async function wrapSendWithToolLoop(payload, sendFn) {
     return sendFn(payload);
   }
 
-  const tree = loadTree(_pendingTreeName);
+  const tree = _pendingTree ?? loadTree(_pendingTreeName);
   if (!tree) return sendFn(payload);
 
   // Check if any TunnelVision tools are in this payload
@@ -449,7 +444,6 @@ module.exports = {
   priority: 26,
   router,
   transformRequest,
-  transformResponse,
   wrapSendWithToolLoop,
   extractBotName,
   primeTreeName,

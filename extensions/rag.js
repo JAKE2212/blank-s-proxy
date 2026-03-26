@@ -45,11 +45,14 @@ const DEFAULT_CONFIG = {
   blindNextTurn: false,
 };
 
+let _configCache = null;
+
 function loadConfig() {
+  if (_configCache) return _configCache;
   try {
     if (fs.existsSync(CONFIG_PATH)) {
-      const saved = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
-      return { ...DEFAULT_CONFIG, ...saved };
+      _configCache = { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")) };
+      return _configCache;
     }
   } catch (e) {
     console.warn("[rag] Failed to load config, using defaults:", e.message);
@@ -58,7 +61,8 @@ function loadConfig() {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULT_CONFIG, null, 2));
     console.log("[rag] Created default config at data/rag-config.json");
   } catch {}
-  return { ...DEFAULT_CONFIG };
+  _configCache = { ...DEFAULT_CONFIG };
+  return _configCache;
 }
 
 // ── Emotion handling ──────────────────────────────────────────────────────────
@@ -235,8 +239,8 @@ function buildQueryText(messages, depth) {
 
 const _stats = {
   lastInjectionChars: 0,
-  lastInjectionChars_total: 0,
   lastActiveChars: [],
+  lastInjectionMsg: 0,
   lastIndexedChars: [],
   lastIndexedMsg: 0,
   lastEmotion: "none",
@@ -244,10 +248,23 @@ const _stats = {
   totalIndexed: 0,
 };
 
-// Carries data from transformRequest → transformResponse within the same turn.
-let _pending = null;
-// Track last user message to detect rerolls
-let _lastUserText = null;
+// Per-request state (transformRequest → transformResponse)
+const _pendingMap = new Map();
+const PENDING_TTL_MS = 5 * 60 * 1000;
+
+function cleanupPending() {
+  const now = Date.now();
+  for (const [key, val] of _pendingMap) {
+    if (now - val.timestamp > PENDING_TTL_MS) _pendingMap.delete(key);
+  }
+}
+
+// Cross-turn state (accumulated char names, emotion, reroll detection)
+let _turnState = {
+  lastCharNames: [],
+  lastEmotion: "neutral",
+  lastUserText: null,
+};
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
@@ -306,6 +323,7 @@ router.post("/blind-next", (req, res) => {
       CONFIG_PATH,
       JSON.stringify({ ...current, blindNextTurn: true }, null, 2),
     );
+    _configCache = null;
     res.json({
       ok: true,
       message: "Next turn will be indexed as temporally blind",
@@ -320,6 +338,7 @@ router.post("/config", (req, res) => {
     const current = loadConfig();
     const updated = { ...current, ...req.body };
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(updated, null, 2));
+    _configCache = null;
     res.json({ ok: true, config: updated });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -347,25 +366,26 @@ async function transformRequest(payload) {
       : (lastUserMsg?.content?.[0]?.text ?? "");
 
   // Carry known char names + emotion from previous turn
-  const knownCharNames = _pending?.lastCharNames ?? [];
-  const currentEmotion = _pending?.lastEmotion ?? "neutral";
-
-  // Carry state forward to transformResponse
-  _pending = {
-    userText,
-    msgCount,
-    lastCharNames: knownCharNames,
-    lastEmotion: currentEmotion,
-    userName,
-  };
+  const knownCharNames = _turnState.lastCharNames;
+  const currentEmotion = _turnState.lastEmotion;
 
   // Detect reroll — same user message as last time
-  const isReroll = userText && userText === _lastUserText;
+  const isReroll = userText && userText === _turnState.lastUserText;
   if (isReroll) {
     console.log("[rag] Reroll detected — skipping index this turn");
-    _pending.isReroll = true;
   }
-  _lastUserText = userText || _lastUserText;
+  _turnState.lastUserText = userText || _turnState.lastUserText;
+
+    // Stash per-request state for transformResponse
+  const reqId = payload._ragReqId ?? (payload._ragReqId = Math.random().toString(36).slice(2, 8));
+  cleanupPending();
+  _pendingMap.set(reqId, {
+    userText,
+    msgCount,
+    userName,
+    isReroll,
+    timestamp: Date.now(),
+  });
 
   // Inject emotion instruction into system prompt
   let newMessages = messages;
@@ -459,7 +479,15 @@ async function transformRequest(payload) {
 
 async function transformResponse(data) {
   const config = loadConfig();
-  if (!config.enabled || !_pending) return data;
+  if (!config.enabled) return data;
+
+  // Find pending state — grab the most recent entry
+  const pendingEntry = _pendingMap.size > 0
+    ? [..._pendingMap.entries()].pop()
+    : null;
+  if (!pendingEntry) return data;
+  const [pendingKey, pending] = pendingEntry;
+  _pendingMap.delete(pendingKey);
 
   const rawText = data?.choices?.[0]?.message?.content ?? "";
   if (!rawText) return data;
@@ -483,12 +511,12 @@ async function transformResponse(data) {
   }
 
   // Extract ALL character names from the clean reply
-  const foundNames = extractAllCharNamesFromReply(cleanText, _pending.userName);
+  const foundNames = extractAllCharNamesFromReply(cleanText, pending.userName);
 
   // Merge newly found names with known names from previous turns
   // Use a Set to deduplicate — characters accumulate over the session
   const mergedNames = [
-    ...new Set([...(_pending.lastCharNames ?? []), ...foundNames]),
+    ...new Set([..._turnState.lastCharNames, ...foundNames]),
   ];
 
   if (foundNames.length > 0) {
@@ -496,11 +524,11 @@ async function transformResponse(data) {
   }
 
   // Always carry forward the latest merged list + emotion for next request
-  _pending.lastCharNames = mergedNames;
-  _pending.lastEmotion = emotion;
+  _turnState.lastCharNames = mergedNames;
+  _turnState.lastEmotion = emotion;
 
   // Skip indexing on rerolls
-  if (_pending.isReroll) {
+  if (pending.isReroll) {
     return finalData;
   }
 
@@ -519,9 +547,9 @@ async function transformResponse(data) {
       await indexTurn(
         {
           charName,
-          userText: _pending.userText ?? "",
+          userText: pending.userText ?? "",
           assistantText: cleanText,
-          messageIndex: _pending.msgCount,
+          messageIndex: pending.msgCount,
           emotion,
           temporallyBlind: isBlind,
         },
@@ -544,16 +572,17 @@ async function transformResponse(data) {
         CONFIG_PATH,
         JSON.stringify({ ...current, blindNextTurn: false }, null, 2),
       );
+      _configCache = null;
       console.log("[rag] Temporally blind turn indexed — flag reset");
     } catch {}
   }
 
   if (indexedNames.length > 0) {
     console.log(
-      `[rag] Indexed turn for: ${indexedNames.join(", ")} (msg ${_pending.msgCount}, emotion: ${emotion})`,
+      `[rag] Indexed turn for: ${indexedNames.join(", ")} (msg ${pending.msgCount}, emotion: ${emotion})`,
     );
     _stats.lastIndexedChars = indexedNames;
-    _stats.lastIndexedMsg = _pending.msgCount;
+    _stats.lastIndexedMsg = pending.msgCount;
     _stats.totalIndexed += indexedNames.length;
   }
 

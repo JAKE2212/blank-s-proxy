@@ -29,7 +29,6 @@ let _cache      = null;   // loaded scripts array
 let _dirty      = true;   // true = reload from disk on next access
 let _counters   = {};     // { [scriptId]: number } — hit counts this session
 
-function invalidateCache() { _dirty = true; }
 
 function loadScripts() {
   if (!_dirty && _cache !== null) return _cache;
@@ -88,12 +87,13 @@ function applyScript(text, script) {
   re.lastIndex = 0;
 
   if (script.dryRun) {
-    const matches = [...text.matchAll(new RegExp(pattern, flags.includes("g") ? flags : flags + "g"))];
+    re.lastIndex = 0;
+    const matches = [...text.matchAll(re)];
     console.log(
       `[regex] DRY RUN "${script.description ?? script.id}" — would match ${matches.length} time(s):`,
       matches.map(m => JSON.stringify(m[0])).join(", "),
     );
-    return { text, fired: true }; // fired = true (matched) but text unchanged
+    return { text, fired: true };
   }
 
   const replacement = normalizeReplacement(script.replaceString);
@@ -199,6 +199,12 @@ router.post("/scripts", (req, res) => {
     dryRun:        req.body.dryRun        ?? false,
     tags:          req.body.tags          ?? [],
   };
+  try {
+    const { pattern, flags } = parseRegex(script.findRegex, script.flags);
+    new RegExp(pattern, flags);
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: `Invalid regex: ${e.message}` });
+  }
   scripts.push(script);
   saveScripts(scripts);
   res.status(201).json({ ok: true, script });
@@ -209,6 +215,15 @@ router.put("/scripts/:id", (req, res) => {
   const scripts = loadScripts();
   const idx = scripts.findIndex(s => s.id === req.params.id);
   if (idx === -1) return res.status(404).json({ ok: false, error: "Not found" });
+  const incoming = { ...scripts[idx], ...req.body };
+  if (incoming.findRegex) {
+    try {
+      const { pattern, flags } = parseRegex(incoming.findRegex, incoming.flags);
+      new RegExp(pattern, flags);
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: `Invalid regex: ${e.message}` });
+    }
+  }
   scripts[idx] = { ...scripts[idx], ...req.body, id: scripts[idx].id };
   saveScripts(scripts);
   res.json({ ok: true, script: scripts[idx] });
@@ -285,6 +300,15 @@ router.post("/import", (req, res) => {
     dryRun:        false,
     tags:          s.tags         ?? [],
   }));
+  // Validate regexes before saving
+  for (const s of imported) {
+    try {
+      const { pattern, flags } = parseRegex(s.findRegex, s.flags);
+      new RegExp(pattern, flags);
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: `Invalid regex in "${s.description}": ${e.message}` });
+    }
+  }
   const merged = [...loadScripts(), ...imported];
   saveScripts(merged);
   res.json({ ok: true, scripts: merged });
@@ -317,7 +341,7 @@ router.get("/counters", (req, res) => {
 
 // POST /extensions/regex/counters/reset — reset all counters
 router.post("/counters/reset", (req, res) => {
-  _counters = {};
+  for (const key of Object.keys(_counters)) delete _counters[key];
   res.json({ ok: true });
 });
 
