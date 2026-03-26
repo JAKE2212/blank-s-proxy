@@ -59,22 +59,27 @@ const DEFAULT_CONFIG = {
 // are replaced at runtime.
 
 const CHECK_PROMPTS = {
-  step1: `You are a strict quality-control editor for AI roleplay responses.
+  step1: `You are a quality-control editor for AI roleplay responses.
 
 You will be given:
 - The full system prompt the AI was instructed to follow
 - The AI's response
 
-Your job: does the response contain any CLEAR, OBVIOUS violations of the system prompt's technical rules?
+Your job: does the response follow the system prompt's rules?
 
-Focus on:
-- Format rules (asterisks for narration, "quotes" for dialogue, backticks for NPC internal thoughts)
-- Required response header ([HH:MM AM/PM, DayName, Month Day, Year] / [Location: ...])
-- Acoustic payload mandate (every vocalization must have a phonetic rendering in quotes)
-- Show-don't-tell (no direct emotion labeling like "he felt angry" or "she was nervous")
-- Forbidden elements (bullet points, numbered lists, meta-commentary, philosophical endings)
+Read the system prompt carefully and check ONLY for rules that are explicitly stated there. Do NOT enforce rules that aren't in the system prompt.
 
-IMPORTANT: Minor imperfections are acceptable. Only fail if there is a genuine, clear violation that would noticeably break immersion.
+Common things to check IF the system prompt requires them:
+- Formatting rules (narration style, dialogue formatting, etc.)
+- Any explicitly forbidden words, phrases, or behaviors
+- Show-don't-tell (only if the system prompt explicitly requires it)
+- Any required response structure or headers (only if explicitly specified)
+
+IMPORTANT:
+- If the system prompt doesn't mention a rule, don't enforce it
+- Minor stylistic choices are NOT violations
+- Creative writing decisions (word choice, pacing, metaphor) are NOT violations
+- Only fail if there is a genuine, clear violation of an explicitly stated rule
 
 SYSTEM PROMPT:
 {{SYSTEM_PROMPT}}
@@ -82,7 +87,7 @@ SYSTEM PROMPT:
 AI RESPONSE:
 {{REPLY}}
 
-Answer with exactly one word: YES (the response passes) or NO (there is a clear violation).`,
+Answer with exactly one word: YES (the response follows the system prompt's rules) or NO (there is a clear violation of an explicitly stated rule).`,
 
   step2: `You are a character authenticity editor for AI roleplay responses.
 
@@ -172,16 +177,12 @@ Answer with exactly one word: YES (story is progressing) or NO (there is a clear
 // ── Rewrite prompts ────────────────────────────────────────────────────────────
 
 const REWRITE_PROMPTS = {
-  step1: `You are a prose editor. The response below has violated one or more technical formatting rules.
+  step1: `You are a prose editor. The response below has violated one or more rules from the system prompt.
 
-Rewrite it to fix ALL of the following issues if present:
-- Add the required header if missing: [HH:MM AM/PM, DayName, Month Day, Year] / [Location: ...]
-- Ensure narration/actions use *asterisks*, spoken dialogue uses "double quotes", NPC internal thoughts use \`backticks\`
-- Add phonetic sounds in quotes after every vocalization (gasp, moan, whimper, etc.) — e.g. *A ragged gasp.* → "Haa—!"
-- Replace any direct emotion labels ("she felt nervous", "he was angry") with physical/somatic observables
-- Remove any bullet points, numbered lists, meta-commentary, or philosophical ending statements
+Read the system prompt carefully. Fix ONLY the specific violations — do not change anything that isn't broken.
 
-Preserve all content, all events, all characters, all plot. Only fix the formatting and show-don't-tell violations.
+Preserve all content, events, characters, plot, voice, and writing style. Make the minimum changes necessary to comply with the system prompt's rules.
+
 Respond with only the corrected text. No commentary, no preamble.
 
 SYSTEM PROMPT (for reference):
@@ -495,7 +496,9 @@ async function runStep(stepKey, stepNumber, reply, vars, config, requestModel) {
 async function transformRequest(payload) {
   // Stash context for use in transformResponse
   try {
-    const systemPrompt = extractSystemPrompt(payload.messages);
+    // Prefer raw system prompt stashed by index.js (before extensions modified it)
+    const systemPrompt = module.exports._rawSystemPrompt ?? extractSystemPrompt(payload.messages);
+    module.exports._rawSystemPrompt = null; // consume it
     _pending = {
       model: payload.model || "",
       systemPrompt,
@@ -551,12 +554,14 @@ async function transformResponse(data) {
     return data; // return original on catastrophic failure
   }
 
-  // Write final reply back
-    if (reply === originalReply) return data;
+  // Strip any emotion tag that rewrite may have re-introduced
+    const cleanReply = reply.replace(/<emotion>[a-z]+<\/emotion>\s*/i, "").trimStart();
+
+    if (cleanReply === originalReply) return data;
     return {
       ...data,
       choices: data.choices.map((c, i) =>
-        i === 0 ? { ...c, message: { ...c.message, content: reply } } : c,
+        i === 0 ? { ...c, message: { ...c.message, content: cleanReply } } : c,
       ),
     };
 }

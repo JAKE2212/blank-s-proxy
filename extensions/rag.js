@@ -17,8 +17,9 @@
 const fs = require("fs");
 const path = require("path");
 const express = require("express");
-const { retrieve, indexTurn } = require("../lib/rag-retriever");
+const { retrieve, retrieveLinked, indexTurn } = require("../lib/rag-retriever");
 const { getPointCount } = require("../lib/rag-store");
+const { extractCharNames, extractUserName } = require("../lib/character-detector");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -99,122 +100,6 @@ function extractEmotion(text) {
   const emotion = VALID_EMOTIONS.has(label) ? label : "neutral";
   const cleanText = text.slice(0, match.index) + text.slice(match.index + match[0].length);
   return { emotion, cleanText };
-}
-
-// ── Character name extraction ─────────────────────────────────────────────────
-
-/**
- * Extract the user's name from messages.
- * JanitorAI formats user messages as "Name : message text"
- * @param {object[]} messages
- * @returns {string|null}
- */
-function extractUserName(messages) {
-  const userMsgs = messages.filter((m) => m.role === "user");
-  for (const msg of userMsgs.slice(-3).reverse()) {
-    const text =
-      typeof msg.content === "string"
-        ? msg.content
-        : (msg.content?.[0]?.text ?? "");
-    const match = text.match(/^([A-Z][a-zA-Z]{1,20})\s*:/);
-    if (match) return match[1].toLowerCase();
-  }
-  return null;
-}
-
-const PRONOUN_BLOCKLIST = new Set([
-  "he",
-  "she",
-  "they",
-  "it",
-  "his",
-  "her",
-  "their",
-  "its",
-  "him",
-  "them",
-  "we",
-  "us",
-  "our",
-  "my",
-  "your",
-  "i",
-  // Common non-name words that start sentences
-  "the",
-  "a",
-  "an",
-  "this",
-  "that",
-  "these",
-  "those",
-  "one",
-  "two",
-  "three",
-  "then",
-  "when",
-  "where",
-  "what",
-]);
-
-/**
- * Extract ALL unique character names from a reply.
- * Scans every line for possessive patterns and action verbs.
- * Returns a deduplicated array of lowercase names, excluding the user's name
- * and common pronouns/words.
- *
- * @param {string}      replyText
- * @param {string|null} userName   — blocklisted name (the user's character)
- * @returns {string[]}             — e.g. ['kurt', 'dale']
- */
-function extractAllCharNamesFromReply(replyText, userName) {
-  if (!replyText) return [];
-
-  const found = new Set();
-
-  const lines = replyText
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0 && !/^[-—*#\[]+$/.test(l));
-
-  for (const line of lines) {
-    const clean = line
-      .replace(/^\*+/, "")
-      .replace(/\[.*?\]/g, "")
-      .trim();
-
-    // Pattern 1 — possessive: "Kurt's jaw tightened"
-    const possessiveMatches = clean.matchAll(/\b([A-Z][a-z]{1,20})'s\b/g);
-    for (const m of possessiveMatches) {
-      const name = m[1].toLowerCase();
-      if (name !== userName && !PRONOUN_BLOCKLIST.has(name)) {
-        found.add(name);
-      }
-    }
-
-    // Pattern 2 — action verb: "Kurt stepped forward"
-    const actionMatches = clean.matchAll(
-      /\b([A-Z][a-z]{1,20})\s+(?:stepped|turned|said|looked|felt|moved|stood|walked|ran|smiled|frowned|crossed|glanced|stared|grabbed|reached|spoke|asked|replied|growled|snapped|sighed|laughed|narrowed|clenched|exhaled|inhaled|shrugged|nodded|shook|leaned|pulled|pushed|dropped|raised|lowered|tilted|pressed|placed|held|kept|let|made|gave|took|came|went|sat|lay|rose|fell|spun|jerked|flinched|tensed|relaxed|watched|waited|paused|stopped|started|opened|closed|turned|moved|shifted|stepped|backed|leaned|reached|stretched|twisted|arched|curled|spread|folded|crossed)\b/g,
-    );
-    for (const m of actionMatches) {
-      const name = m[1].toLowerCase();
-      if (name !== userName && !PRONOUN_BLOCKLIST.has(name)) {
-        found.add(name);
-      }
-    }
-
-    // Pattern 3 — dialogue attribution: `"text," Kurt said` or `"text." Kurt`
-    const dialogueMatches = clean.matchAll(
-      /["'][^"']+["']\s*[,.]?\s*([A-Z][a-z]{1,20})\b/g,
-    );
-    for (const m of dialogueMatches) {
-      const name = m[1].toLowerCase();
-      if (name !== userName && !PRONOUN_BLOCKLIST.has(name)) {
-        found.add(name);
-      }
-    }
-  }
-
-  return [...found];
 }
 
 /**
@@ -409,10 +294,13 @@ async function transformRequest(payload) {
 
   // Retrieve context for each known character independently
   const contextBlocks = [];
+  const linkedChars = new Set(); // tracks which chars we've already retrieved
+
   for (const charName of knownCharNames) {
-    let context = null;
+    linkedChars.add(charName);
+    let result = null;
     try {
-      context = await retrieve(
+      result = await retrieve(
         {
           charName,
           queryText,
@@ -430,12 +318,55 @@ async function transformRequest(payload) {
       continue;
     }
 
-    if (context) {
-      const trimmed = context.slice(0, config.maxInjectionChars);
+    if (result.context) {
+      const trimmed = result.context.slice(0, config.maxInjectionChars);
       contextBlocks.push({ charName, context: trimmed });
       console.log(
         `[rag] Retrieved ${trimmed.length} chars for "${charName}" (emotion: ${currentEmotion})`,
       );
+
+      // Track co-characters for cross-linking
+      for (const co of result.coCharacters) {
+        if (!linkedChars.has(co) && knownCharNames.includes(co)) {
+          linkedChars.add(co);
+        }
+      }
+    }
+  }
+
+  // Cross-character linking — retrieve context for co-occurring characters
+  // Only fires when a retrieved chunk mentions another known character
+  const alreadyRetrieved = new Set(contextBlocks.map(b => b.charName));
+  const charsToLink = [...linkedChars].filter(c => !alreadyRetrieved.has(c));
+
+  if (charsToLink.length > 0) {
+    console.log(`[rag] Cross-character linking: ${charsToLink.join(", ")}`);
+    for (const charName of charsToLink) {
+      try {
+        const linkedContext = await retrieveLinked(
+          {
+            charName,
+            queryText,
+            currentIndex: msgCount,
+            emotion: currentEmotion,
+            emotionBoost: config.emotionBoost,
+            linkedTopK: 2,
+          },
+          config,
+        );
+        if (linkedContext) {
+          const trimmed = linkedContext.slice(0, config.maxInjectionChars);
+          contextBlocks.push({ charName, context: trimmed, linked: true });
+          console.log(
+            `[rag] Linked ${trimmed.length} chars for "${charName}" (co-character)`,
+          );
+        }
+      } catch (e) {
+        console.warn(
+          `[rag] Linked retrieval failed for "${charName}" (non-fatal):`,
+          e.message,
+        );
+      }
     }
   }
 
@@ -444,10 +375,22 @@ async function transformRequest(payload) {
   }
 
   // Build combined injection — one labeled block per character
-  const combined = contextBlocks
+  // Enforce shared maxInjectionChars budget across all blocks
+  const maxTotal = config.maxInjectionChars ?? 2000;
+  let charBudget = maxTotal;
+  const budgetedBlocks = [];
+
+  for (const block of contextBlocks) {
+    if (charBudget <= 0) break;
+    const trimmed = block.context.slice(0, charBudget);
+    budgetedBlocks.push({ ...block, context: trimmed });
+    charBudget -= trimmed.length;
+  }
+
+  const combined = budgetedBlocks
     .map(
-      ({ charName, context }) =>
-        `[Relevant Memory Context — ${charName}]\n${context}\n[End Memory Context — ${charName}]`,
+      ({ charName, context, linked }) =>
+        `[Relevant Memory Context — ${charName}${linked ? " (linked)" : ""}]\n${context}\n[End Memory Context — ${charName}]`,
     )
     .join("\n\n");
 
@@ -462,15 +405,15 @@ async function transformRequest(payload) {
     newMessages.unshift({ role: "system", content: combined });
   }
 
-  const totalChars = contextBlocks.reduce(
+  const totalChars = budgetedBlocks.reduce(
     (sum, b) => sum + b.context.length,
     0,
   );
-  const charList = contextBlocks.map((b) => b.charName).join(", ");
+  const charList = budgetedBlocks.map((b) => `${b.charName}${b.linked ? " (linked)" : ""}`).join(", ");
   console.log(`[rag] Injected ${totalChars} total chars for: ${charList}`);
 
   _stats.lastInjectionChars = totalChars;
-  _stats.lastActiveChars = contextBlocks.map((b) => b.charName);
+  _stats.lastActiveChars = budgetedBlocks.map((b) => b.charName);
   _stats.lastInjectionMsg = msgCount;
   _stats.totalInjections++;
 
@@ -511,7 +454,7 @@ async function transformResponse(data) {
   }
 
   // Extract ALL character names from the clean reply
-  const foundNames = extractAllCharNamesFromReply(cleanText, pending.userName);
+  const foundNames = extractCharNames(cleanText, pending.userName);
 
   // Merge newly found names with known names from previous turns
   // Use a Set to deduplicate — characters accumulate over the session
@@ -542,7 +485,9 @@ async function transformResponse(data) {
   const isBlind = config.blindNextTurn === true;
   const indexedNames = [];
 
+  // Build co-characters list — other characters in this same reply
   for (const charName of foundNames) {
+    const coCharacters = foundNames.filter(n => n !== charName);
     try {
       await indexTurn(
         {
@@ -552,6 +497,7 @@ async function transformResponse(data) {
           messageIndex: pending.msgCount,
           emotion,
           temporallyBlind: isBlind,
+          coCharacters,
         },
         config,
       );

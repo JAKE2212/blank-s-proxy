@@ -12,6 +12,7 @@
 const fs = require("fs");
 const path = require("path");
 const express = require("express");
+const { resolveAlias } = require("../lib/character-detector");
 
 const {
   getOrCreateTree,
@@ -22,6 +23,7 @@ const {
   buildTreeOverview,
   addNode,
   deleteTree,
+  runDiagnostics,
 } = require("../lib/tunnelvision/tv-tree");
 
 const {
@@ -39,6 +41,8 @@ const DEFAULT_CONFIG = {
   autoDetect: true, // extract bot name from <BotName's Persona> tag
   injectContext: true, // prepend retrieved context into system prompt
   maxContextChars: 3000, // cap on injected context length
+  searchMode: "auto", // "auto", "collapsed", or "traversal"
+  traversalThreshold: 15, // node count threshold for auto mode
 };
 
 let _configCache = null;
@@ -96,7 +100,7 @@ function extractBotName(messages) {
   const match = text.match(/<([A-Za-z][A-Za-z0-9 '_-]{0,39})'s Persona>/);
   if (!match) return null;
 
-  return sanitizeCharName(match[1]);
+  return sanitizeCharName(resolveAlias(match[1].toLowerCase()));
 }
 
 // ── Tool call extraction ──────────────────────────────────────────────────────
@@ -348,6 +352,32 @@ router.delete("/tree/:name", (req, res) => {
   }
 });
 
+// GET /extensions/tunnelvision/tree/:name/diagnostics — run health checks
+router.get("/tree/:name/diagnostics", (req, res) => {
+  const tree = loadTree(req.params.name);
+  if (!tree)
+    return res.status(404).json({ ok: false, error: "Tree not found" });
+  try {
+    const result = runDiagnostics(tree);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /extensions/tunnelvision/tree/:name/diagnostics — run health checks with auto-fix
+router.post("/tree/:name/diagnostics", (req, res) => {
+  const tree = loadTree(req.params.name);
+  if (!tree)
+    return res.status(404).json({ ok: false, error: "Tree not found" });
+  try {
+    const result = runDiagnostics(tree);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Extension hooks ───────────────────────────────────────────────────────────
 
 /**
@@ -388,7 +418,12 @@ async function transformRequest(payload) {
   );
 
   // Inject tool definitions
-  const tools = buildToolDefinitions(tree);
+  const nodeCount = Object.keys(tree.nodes).length;
+  const mode = config.searchMode ?? "auto";
+  const forceTraversal = mode === "traversal" || (mode === "auto" && nodeCount >= (config.traversalThreshold ?? 15));
+  const tools = buildToolDefinitions(tree, { forceTraversal });
+
+  console.log(`[tunnelvision] Search mode: ${forceTraversal ? "traversal" : "collapsed"} (${nodeCount} nodes, config: ${mode})`);
 
   return {
     ...payload,

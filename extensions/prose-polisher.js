@@ -17,6 +17,7 @@ const path = require("path");
 
 const CONFIG_FILE = path.join(__dirname, "../data/prose-polisher-config.json");
 const STATE_FILE  = path.join(__dirname, "../data/prose-polisher-state.json");
+const foundNames = extractCharNames(cleanText, pending.userName);
 
 // ── Config cache ───────────────────────────────────────────
 let _configCache = null;
@@ -118,53 +119,10 @@ function addSessionChars(names) {
 
 // ── Character name extraction ──────────────────────────────
 
-const PRONOUN_BLOCKLIST = new Set([
-  "he","she","they","it","his","her","their","its",
-  "him","them","we","us","our","my","your","i",
-  "the","a","an","this","that","these","those",
-  "one","two","three","then","when","where","what",
-]);
-
 /**
  * Extract all unique character names from a reply.
  * Capped to first 2000 chars to avoid slow regex on huge responses.
  */
-function extractAllCharNames(replyText, userName) {
-  if (!replyText) return [];
-  const text  = replyText.slice(0, 2000); // cap for performance
-  const found = new Set();
-
-  const lines = text
-    .split("\n")
-    .map(l => l.trim())
-    .filter(l => l.length > 0 && !/^[-—*#\[]+$/.test(l));
-
-  for (const line of lines) {
-    const clean = line.replace(/^\*+/, "").replace(/\[.*?\]/g, "").trim();
-
-    // Possessive: "Kurt's jaw tightened"
-    for (const m of clean.matchAll(/\b([A-Z][a-z]{1,20})'s\b/g)) {
-      const name = m[1].toLowerCase();
-      if (name !== userName && !PRONOUN_BLOCKLIST.has(name)) found.add(name);
-    }
-
-    // Action verb: "Kurt stepped forward"
-    for (const m of clean.matchAll(
-      /\b([A-Z][a-z]{1,20})\s+(?:stepped|turned|said|looked|felt|moved|stood|walked|ran|smiled|frowned|crossed|glanced|stared|grabbed|reached|spoke|asked|replied|growled|snapped|sighed|laughed|narrowed|clenched|exhaled|inhaled|shrugged|nodded|shook|leaned|pulled|pushed|dropped|raised|lowered|tilted|pressed|placed|held|kept|let|made|gave|took|came|went|sat|lay|rose|fell|spun|jerked|flinched|tensed|relaxed|watched|waited|paused|stopped|started|opened|closed|shifted|backed|stretched|twisted|arched|curled|spread|folded)\b/g,
-    )) {
-      const name = m[1].toLowerCase();
-      if (name !== userName && !PRONOUN_BLOCKLIST.has(name)) found.add(name);
-    }
-
-    // Dialogue attribution: `"text," Kurt said`
-    for (const m of clean.matchAll(/["'][^"']+["']\s*[,.]?\s*([A-Z][a-z]{1,20})\b/g)) {
-      const name = m[1].toLowerCase();
-      if (name !== userName && !PRONOUN_BLOCKLIST.has(name)) found.add(name);
-    }
-  }
-
-  return [...found];
-}
 
 // ── Bundled data ───────────────────────────────────────────
 
@@ -467,7 +425,7 @@ function transformResponse(responseBody) {
 
   // Load state once for this response
   const state     = loadState();
-  const charNames = extractAllCharNames(text, null);
+  const charNames = extractCharNames(text, null);
 
   if (charNames.length > 0) {
     console.log(`[prose-polisher] Analyzing reply for: ${charNames.join(", ")}`);
