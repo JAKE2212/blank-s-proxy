@@ -7,9 +7,8 @@
 //   - Config cached in memory (no disk read per request)
 //   - State loaded once per turn (not twice)
 //   - transformRequest returns new object (no in-place mutation)
-//   - _pending scoped per-request via request ID to avoid concurrency issues
-//   - lastCharNames capped + session-reset to prevent stale accumulation
-//   - extractAllCharNames capped to first 2000 chars
+//   - Session char accumulator with 30min TTL reset
+//   - Uses shared lib/character-detector.js for name extraction
 // ============================================================
 
 const fs   = require("fs");
@@ -17,9 +16,10 @@ const path = require("path");
 
 const CONFIG_FILE = path.join(__dirname, "../data/prose-polisher-config.json");
 const STATE_FILE  = path.join(__dirname, "../data/prose-polisher-state.json");
-const foundNames = extractCharNames(cleanText, pending.userName);
+const { extractCharNames } = require("../lib/character-detector");
 
 // ── Config cache ───────────────────────────────────────────
+
 let _configCache = null;
 
 const DEFAULT_CONFIG = {
@@ -39,7 +39,10 @@ const DEFAULT_CONFIG = {
 function loadConfig() {
   if (_configCache) return _configCache;
   try {
-    if (!fs.existsSync(CONFIG_FILE)) { _configCache = { ...DEFAULT_CONFIG }; return _configCache; }
+    if (!fs.existsSync(CONFIG_FILE)) {
+      _configCache = { ...DEFAULT_CONFIG };
+      return _configCache;
+    }
     _configCache = { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")) };
     return _configCache;
   } catch {
@@ -55,7 +58,10 @@ let _stateCache = null;
 function loadState() {
   if (_stateCache) return _stateCache;
   try {
-    if (!fs.existsSync(STATE_FILE)) { _stateCache = freshState(); return _stateCache; }
+    if (!fs.existsSync(STATE_FILE)) {
+      _stateCache = freshState();
+      return _stateCache;
+    }
     const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
 
     // ── Migration: old flat format → per-character format ──
@@ -95,11 +101,10 @@ function saveState(state) {
   });
 }
 
+// ── Session char accumulator ───────────────────────────────
 
-
-// Session char name accumulator — resets when no activity for 30 minutes
-let _sessionChars    = [];
-let _lastActivityMs  = 0;
+let _sessionChars   = [];
+let _lastActivityMs = 0;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
 function getSessionChars() {
@@ -115,14 +120,6 @@ function addSessionChars(names) {
   _lastActivityMs = Date.now();
   _sessionChars = [...new Set([..._sessionChars, ...names])].slice(0, 20);
 }
-
-
-// ── Character name extraction ──────────────────────────────
-
-/**
- * Extract all unique character names from a reply.
- * Capped to first 2000 chars to avoid slow regex on huge responses.
- */
 
 // ── Bundled data ───────────────────────────────────────────
 
@@ -378,7 +375,6 @@ function transformRequest(payload) {
   const sessionChars = getSessionChars();
   const notes        = [];
 
-  // Per-character style notes (capped at maxCharsInjected)
   const charsToInject = sessionChars.slice(0, config.maxCharsInjected ?? 5);
   for (const charName of charsToInject) {
     const charState = state.chars[charName];
@@ -389,7 +385,6 @@ function transformRequest(payload) {
     }
   }
 
-  // Global scene-level note
   const globalSlop = buildSlopList(state.global, config);
   if (globalSlop.length > 0) {
     notes.push(`[Style note (scene): avoid repeating — ${globalSlop.join("; ")}]`);
@@ -406,7 +401,6 @@ function transformRequest(payload) {
     return { ...m, content: (m.content || "") + "\n\n" + note };
   });
 
-  // If no system message exists, prepend one
   const hasSys = messages.some(m => m.role === "system");
   if (!hasSys) messages.unshift({ role: "system", content: note });
 
@@ -423,7 +417,6 @@ function transformResponse(responseBody) {
     null;
   if (typeof text !== "string") return responseBody;
 
-  // Load state once for this response
   const state     = loadState();
   const charNames = extractCharNames(text, null);
 
@@ -441,7 +434,6 @@ function transformResponse(responseBody) {
     console.log("[prose-polisher] No character names found — analyzing into global pool");
   }
 
-  // Always update global pool
   state.global = analyzeText(text, state.global, config);
   saveState(state);
 
