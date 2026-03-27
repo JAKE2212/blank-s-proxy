@@ -30,6 +30,7 @@ const {
   buildToolDefinitions,
   dispatchToolCall,
 } = require("../lib/tunnelvision/tv-tools");
+const localModels = require("../lib/local-models");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -175,11 +176,33 @@ function executeToolCalls(tree, toolCalls) {
 const MAX_TOOL_ROUNDS = 6;
 
 async function runToolLoop(payload, tree, sendFn) {
+  const lm = localModels.loadConfig();
+  const useLocal = lm.enabled;
+
+  // Strip cache_control blocks — Ollama doesn't support them
   let currentPayload = { ...payload };
+  if (useLocal) {
+    currentPayload = {
+      ...currentPayload,
+      messages: currentPayload.messages.map(m => {
+        if (!Array.isArray(m.content)) return m;
+        return {
+          ...m,
+          content: m.content.map(b => {
+            const { cache_control, ...rest } = b;
+            return rest;
+          }),
+        };
+      }),
+    };
+  }
+
   let round = 0;
 
   while (round < MAX_TOOL_ROUNDS) {
-    const result = await sendFn(currentPayload);
+    const result = useLocal
+      ? await localModels.callOllamaWithTools(currentPayload, lm.tunnelvisionModel)
+      : await sendFn(currentPayload);
     if (!result.ok) return result;
 
     const toolCalls = extractToolCalls(result.data);
@@ -221,7 +244,9 @@ async function runToolLoop(payload, tree, sendFn) {
     ...currentPayload,
     tool_choice: "none",
   };
-  return sendFn(finalPayload);
+  return useLocal
+    ? localModels.callOllamaWithTools(finalPayload, lm.tunnelvisionModel)
+    : sendFn(finalPayload);
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────

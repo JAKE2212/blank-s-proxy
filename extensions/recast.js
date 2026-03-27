@@ -14,6 +14,7 @@ const path = require("path");
 
 const router = express.Router();
 const CONFIG_PATH = path.join(__dirname, "../data/recast-config.json");
+const localModels = require("../lib/local-models");
 
 // ── Defaults ───────────────────────────────────────────────────────────────────
 
@@ -430,12 +431,22 @@ async function runStep(stepKey, stepNumber, reply, vars, config, requestModel) {
     });
     let verdict = "";
     try {
-      verdict = await callOpenRouter(
-        "You are a strict but fair quality-control judge. Answer only YES or NO.",
-        checkPrompt,
-        checkModel,
-        config.checkTokens ?? 100,
-      );
+      const lm = localModels.loadConfig();
+      if (lm.enabled) {
+        verdict = await localModels.callOllama(
+          "You are a strict but fair quality-control judge. Answer only YES or NO.",
+          checkPrompt,
+          lm.recastCheckModel,
+          config.checkTokens ?? 100,
+        );
+      } else {
+        verdict = await callOpenRouter(
+          "You are a strict but fair quality-control judge. Answer only YES or NO.",
+          checkPrompt,
+          checkModel,
+          config.checkTokens ?? 100,
+        );
+      }
     } catch (e) {
       console.warn(
         `[recast] ⚠  ${label} — check error (attempt ${attempt + 1}): ${e.message}`,
