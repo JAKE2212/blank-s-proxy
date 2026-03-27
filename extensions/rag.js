@@ -318,7 +318,7 @@ async function transformRequest(payload) {
   // Use ACTIVE scene chars for retrieval (only chars from the last reply)
   // Fall back to all known chars on first turn (when activeSceneChars is empty)
   const activeChars = _turnState.activeSceneChars;
-  const knownCharNames = activeChars.length > 0 ? activeChars : _turnState.lastCharNames;
+  let knownCharNames = [...(activeChars.length > 0 ? activeChars : _turnState.lastCharNames)];
   const currentEmotion = _turnState.lastEmotion;
 
   // Detect reroll — same user message as last time
@@ -355,8 +355,7 @@ async function transformRequest(payload) {
   const allKnownNames = _turnState.lastCharNames;
   const validUserMentions = userMentionedChars.filter(c => allKnownNames.includes(c));
   if (validUserMentions.length > 0) {
-    const merged = [...new Set([...knownCharNames, ...validUserMentions])];
-    knownCharNames.splice(0, knownCharNames.length, ...merged);
+    knownCharNames = [...new Set([...knownCharNames, ...validUserMentions])];
   }
 
   // Skip retrieval if no query or no known characters yet
@@ -596,9 +595,11 @@ async function transformResponse(data) {
   if (isBlind && indexedNames.length > 0) {
     try {
       const current = loadConfig();
-      fs.writeFileSync(
+      fs.writeFile(
         CONFIG_PATH,
         JSON.stringify({ ...current, blindNextTurn: false }, null, 2),
+        "utf8",
+        (err) => { if (err) console.warn("[rag] Failed to reset blind flag:", err.message); },
       );
       _configCache = null;
       console.log("[rag] Temporally blind turn indexed — flag reset");

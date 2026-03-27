@@ -500,7 +500,7 @@ app.post("/v1/chat/completions", async (req, res) => {
     // Phase 3: Run extensions AFTER RAG/TV (priority > 26)
     for (const ext of extensions) {
       if (parallelSet.has(ext.filename)) continue;
-      if ((ext.priority ?? 50) < 25) continue;
+      if ((ext.priority ?? 50) <= 26) continue;
       if (ext.transformRequest) {
         try {
           transformedPayload = await ext.transformRequest(transformedPayload);
@@ -570,7 +570,7 @@ app.post("/v1/chat/completions", async (req, res) => {
           writeLog({
             event: "error",
             requestId,
-            message: `[extensions] ${ext.name} transformResponse failed: ${e.message}`,
+            message: `[extensions] ${ext.name ?? ext.filename} transformResponse failed: ${e.message}`,
           });
         }
       }
@@ -738,9 +738,11 @@ if (global.gc) {
   }, 60_000);
 }
 
+let lastMemoryWarn = null;
+
 // ── Memory monitoring ──────────────────────────────────────
-const MEMORY_WARN_MB = 400;
-const MEMORY_RESTART_MB = 600;
+const MEMORY_WARN_MB = 512;
+const MEMORY_RESTART_MB = 768;
 
 setInterval(() => {
   const mb = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
@@ -748,7 +750,10 @@ setInterval(() => {
     console.error(`[proxy] ⚠ Memory critical (${mb}MB) — restarting`);
     shutdown("OOM");
   } else if (mb >= MEMORY_WARN_MB) {
-    console.warn(`[proxy] ⚠ Memory high: ${mb}MB`);
+    if (!lastMemoryWarn || Date.now() - lastMemoryWarn > 5 * 60 * 1000) {
+      console.warn(`[proxy] ⚠ Memory high: ${mb}MB`);
+      lastMemoryWarn = Date.now();
+    }
   }
 }, 30000); // check every 30s
 

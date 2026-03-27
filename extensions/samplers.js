@@ -104,7 +104,7 @@ function buildDefaults() {
   }
   return defaults;
 }
-let _configCache = null;
+let _configCache = config;
 
 function loadConfig() {
   if (_configCache) return _configCache;

@@ -17,6 +17,7 @@ const CONFIG_PATH = path.join(__dirname, "../data/recast-config.json");
 const localModels = require("../lib/local-models");
 const { loadTree, getAllEntries } = require("../lib/tunnelvision/tv-tree");
 const { getLastParsed } = require("../lib/custom-prompt");
+const replyCache = require("../lib/reply-cache");
 
 // ── Defaults ───────────────────────────────────────────────────────────────────
 
@@ -63,21 +64,23 @@ const DEFAULT_CONFIG = {
 // are replaced at runtime.
 
 const CHECK_PROMPTS = {
-  step1: `You are a quality-control editor checking an AI roleplay response against specific framework rules.
+  step1: `You are a lenient quality-control editor. You WANT responses to pass. You are looking for reasons to say YES, not reasons to say NO.
 
-Check ONLY these rules — ignore everything else:
+Only fail a response if there is a MAJOR, UNMISTAKABLE violation of one of these rules:
 
-1. SCENE HEADER: Response should start with a header like [HH:MM AM/PM, DayName, Month Day, Year] / [Location: ...]. Missing headers are a violation ONLY if the scene has a clear time/place. Casual dialogue mid-scene does not require a new header.
+1. USER SOVEREIGNTY: The response wrote dialogue, thoughts, or decisions for the user character. This is the ONLY rule that should be checked strictly. Everything else gets the benefit of the doubt.
 
-2. USER SOVEREIGNTY: The response must NEVER write dialogue, actions, thoughts, feelings, or decisions for the user character. It may only describe how NPCs perceive or react to the user. Check if the user character's name appears with any internal thoughts, assumed reactions, or actions they didn't take.
+2. SCENE CLOSURE: The response ends with a philosophical summary paragraph that wraps up the scene's meaning. Ending on a mood, a lingering image, or an unresolved tension is FINE — only fail if the last paragraph literally explains the theme or moral.
 
-3. PHONETIC VOCALIZATIONS: When a character gasps, moans, groans, sighs, or makes any nonverbal sound, it should be followed by a phonetic rendering in quotes (e.g. "Haa—!" or "Ngh!"). A vocalization described without any phonetic sound is a violation. This only applies to explicit vocalization descriptions — not every breath or movement.
+3. FORMAT: Spoken dialogue should use "double quotes". This only matters if dialogue is clearly missing quotes entirely.
 
-4. SCENE CLOSURE: The response should NOT end with a philosophical reflection, thematic summary, or meaning-making statement. It should end on action, dialogue, or an environmental detail.
+Rules that are NOT worth failing over:
+- Missing or imperfect scene headers (nice to have, not required)
+- Missing phonetic sounds on vocalizations (nice to have, not required)
+- Prose style choices, word selection, pacing decisions
+- Anything borderline or debatable
 
-5. FORMAT: Narration should use *asterisks*. Spoken dialogue should use "double quotes". No bullet points or numbered lists in narrative.
-
-Be LENIENT. Only fail for clear, obvious violations — not borderline cases. Minor stylistic choices are fine. Creative decisions are fine. If you're unsure, pass it.
+YOUR DEFAULT ANSWER IS YES. Only say NO if you are absolutely certain there is a clear, major violation. When in doubt, ALWAYS say YES.
 
 SYSTEM PROMPT (for reference):
 {{SYSTEM_PROMPT}}
@@ -85,28 +88,27 @@ SYSTEM PROMPT (for reference):
 AI RESPONSE:
 {{REPLY}}
 
-Answer with exactly one word: YES (passes) or NO (clear violation of one of the 5 rules above).`,
+Answer with exactly one word: YES or NO.`,
 
   step2: `You are a character authenticity editor for AI roleplay responses.
 
 You will be given:
-- The character card describing NPC personality, voice, and psychology
+- The character card describing the NPC's personality, voice, speech patterns, and psychology
 - Lorebook data about characters and story events (if available)
 - The user persona
-- Recent conversation for context
+- Recent conversation messages for context
 - The AI's response
 
-Check these things:
-- Do characters sound like themselves? (vocabulary, verbal tics, speech rhythm, era-appropriate language)
-- Are emotional reactions proportional? (no breakdowns over minor things, no shrugging off heavy moments)
-- Do characters act consistently with their established personality and psychology?
-- If lorebook data is provided, does the response contradict any established character facts?
+Your job: does every character act AND sound like themselves? Are emotional reactions proportional to what actually happened?
 
-Be LENIENT:
-- Characters CAN surprise us — growth, contradiction, and evolution are valid
-- Only fail if a character acts in a way that is FUNDAMENTALLY incompatible with who they are
-- Minor voice inconsistencies are not violations
-- If no lorebook data is available, judge only against the character card
+Focus on:
+- Voice and speech patterns (vocabulary, verbal tics, sentence rhythm, era-appropriate language)
+- Personality consistency (do their actions match their established psychology and wounds?)
+- Proportional reactions (no crying or breaking down over minor things, no shrugging off genuinely devastating events)
+- Behavioral patterns (do they use their established defense mechanisms, not generic ones?)
+- If lorebook data is provided, check for contradictions with established character facts
+
+IMPORTANT: Characters can surprise us — growth and contradiction are valid. Only fail if the character acts in a way that is fundamentally incompatible with who they are. When in doubt, pass it.
 
 CHARACTER CARD:
 {{CHAR_CARD}}
@@ -121,7 +123,7 @@ RECENT CONVERSATION:
 AI RESPONSE:
 {{REPLY}}
 
-Answer with exactly one word: YES (characters are consistent) or NO (clear character violation).`,
+Answer with exactly one word: YES (characters are consistent) or NO (there is a clear character violation).`,
 
   step3: `You are a world-coherence editor for AI roleplay responses.
 
@@ -177,15 +179,13 @@ Answer with exactly one word: YES (story is progressing) or NO (there is a clear
 // ── Rewrite prompts ────────────────────────────────────────────────────────────
 
 const REWRITE_PROMPTS = {
-  step1: `You are a prose editor. The response below violated one of these specific rules:
+  step1: `You are a prose editor. The response below has ONE of these issues:
 
-1. Missing scene header [Time / Location] at the start (add one if the scene has a clear time/place)
-2. Writing dialogue, thoughts, or actions for the user character (remove them)
-3. A nonverbal vocalization (gasp, moan, sigh, etc.) without a phonetic sound in quotes after it (add the phonetic sound)
-4. Ending with a philosophical reflection or thematic summary (cut on action, dialogue, or environment instead)
-5. Wrong format (narration should use *asterisks*, dialogue should use "double quotes")
+1. It wrote dialogue, thoughts, or decisions for the user character — remove those parts
+2. It ended with a philosophical summary paragraph — cut it and end on action, dialogue, or environment instead
+3. Spoken dialogue is missing "double quotes" — add them
 
-Fix ONLY the specific violation. Do not change anything else — preserve all content, events, characters, plot, voice, and style. Make the minimum change necessary.
+Fix ONLY the specific issue. Change as little as possible. Preserve all content, events, characters, plot, voice, and style.
 
 Respond with only the corrected text. No commentary, no preamble.
 
@@ -197,13 +197,14 @@ RESPONSE TO FIX:
 
   step2: `You are a character authenticity editor. The response below has a character consistency or proportional reaction problem.
 
-Fix so that:
-- Characters act and speak true to their established personality and speech patterns
-- Emotional reactions are proportional to what happened
-- Dialogue sounds like that specific person
+Rewrite it so that:
+- Every character acts and speaks in a way that is true to their established personality, psychology, and speech patterns
+- Emotional reactions are proportional to what actually happened
+- Dialogue sounds like that specific person (vocabulary, verbal tics, era-appropriate language)
+- Defense mechanisms and behavioral patterns match the character card
 - If lorebook data is provided, don't contradict established character facts
 
-Make minimum changes. Preserve all plot events and narrative content. Only fix character issues.
+Preserve all plot events and narrative content. Only fix the character authenticity issues.
 Respond with only the corrected text. No commentary, no preamble.
 
 CHARACTER CARD:
@@ -586,7 +587,6 @@ async function transformResponse(data) {
   if (!originalReply || typeof originalReply !== "string") return data;
 
   // Skip recast on rerolls if the previous reply already passed all checks
-  const replyCache = require("../lib/reply-cache");
   const userText = typeof _pending.messages?.findLast?.(m => m.role === "user")?.content === "string"
     ? _pending.messages.findLast(m => m.role === "user").content
     : "";
