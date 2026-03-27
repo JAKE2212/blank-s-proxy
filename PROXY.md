@@ -12,12 +12,16 @@ This document describes every file in the Kiana Proxy codebase — what it does,
   - [index.js](#indexjs)
   - [lib/](#lib)
     - [circuit-breaker.js](#libcircuit-breakerjs)
+    - [custom-prompt.js](#libcustom-promptjs)
     - [dashboard-routes.js](#libdashboard-routesjs)
+    - [local-models.js](#liblocal-modelsjs)
     - [prompt-cache.js](#libprompt-cachejs)
     - [queue.js](#libqueuejs)
     - [rag-embedder.js](#librag-embedderjs)
     - [rag-retriever.js](#librag-retrieverjs)
     - [rag-store.js](#librag-storejs)
+    - [reply-cache.js](#libreply-cachejs)
+    - [character-detector.js](#libcharacter-detectorjs)
     - [tunnelvision/tv-tree.js](#libtunnelvisiontv-treejs)
     - [tunnelvision/tv-tools.js](#libtunnelvisiontv-toolsjs)
   - [extensions/](#extensions)
@@ -55,10 +59,15 @@ JanitorAI ← Proxy ← Extension Pipeline ← OpenRouter
 ```
 
 **Infrastructure:**
-- Node.js/Express running in Docker on Proxmox
+- Node.js 18+ / Express running in Docker on Proxmox (LXC container 100, files at `/opt/proxy/`)
 - Exposed via Cloudflare Tunnel at `https://proxy.kiana-designs.com`
+- SSH access at `ssh.kiana-designs.com`
 - Qdrant vector DB at `192.168.1.192:6333`
-- Ollama at `192.168.1.193:11434` (mxbai-embed-large embeddings)
+- Ollama at `192.168.1.193:11434` (mxbai-embed-large embeddings, qwen2.5:7b for recast checks)
+- Managed via Portainer, edited via VS Code Remote SSH
+- Private GitHub repo (username: JAKE2212)
+- Uptime Kuma for health monitoring
+- Proxmox UI at `proxmox.kiana-designs.com`
 
 ---
 
@@ -72,14 +81,19 @@ POST /v1/chat/completions
   ├─ Queue (MAX_CONCURRENT = 3)
   ├─ Request validation (message count, char limits)
   │
-  ├─ primeTreeName()          ← TunnelVision extracts bot name early
   ├─ applyPromptCaching()     ← Claude only: add cache_control headers
+  ├─ injectPrompt()           ← Strip JanitorAI instructions, inject custom prompt
+  ├─ Stash raw system prompt  ← For recast (before extensions modify it)
+  ├─ primeTreeName()          ← TunnelVision extracts bot name early
   │
-  ├─ transformRequest pipeline (priority order):
-  │     ooc.js (10)
+  ├─ transformRequest pipeline (3-phase):
+  │   Phase 1 — Pre-RAG/TV (priority < 25):
+  │     ooc.js (10)           ← strip OOC commands, inject as system note
   │     regex.js (20)         ← no transformRequest hook
+  │   Phase 2 — RAG + TunnelVision in parallel:
   │     rag.js (25)           ← inject emotion instruction + retrieve context
   │     tunnelvision.js (26)  ← inject tool definitions
+  │   Phase 3 — Post-RAG/TV (priority >= 25, excluding RAG/TV):
   │     samplers.js (30)      ← inject sampler params
   │     prose-polisher.js (40)← inject slop avoidance note
   │     recast.js (45)        ← stash system prompt + context for later
@@ -88,14 +102,17 @@ POST /v1/chat/completions
   │     Each round: OpenRouter → tool calls → execute → append → repeat
   │     Final round: narrative response
   │
+  ├─ Cache raw reply           ← reply-cache.js (before recast)
+  │
   ├─ transformResponse pipeline (priority order):
+  │     regex.js (20)         ← run regex scripts on reply
   │     rag.js (25)           ← strip <emotion> tag, index turn
-  │     tunnelvision.js (26)  ← no-op (cleanup handled in tool loop)
   │     prose-polisher.js (40)← analyze response, update ngram state
   │     recast.js (45)        ← run 4-step check/rewrite pipeline
   │
-  ├─ Log token usage
-  ├─ Duplicate detection
+  ├─ Cache final reply         ← reply-cache.js (after recast)
+  ├─ Log token usage (post-transform)
+  ├─ Duplicate detection (post-transform)
   ├─ Queue release (done())
   └─ res.json(finalData) → JanitorAI
 ```
@@ -111,17 +128,23 @@ POST /v1/chat/completions
 **Key responsibilities:**
 - CORS for JanitorAI's browser origin
 - Proxy auth via `PROXY_API_KEY`
-- Rate limiting (30 req/min per IP via `rateLimitMap`)
+- Rate limiting (30 req/min per IP via `rateLimitMap`, cleaned up every 60s)
 - Extension auto-discovery from `extensions/` folder
 - Extension hot-reload via `fs.watch` (5s debounce)
 - Request validation (max 2000 messages, max 2M chars)
+- Calls `injectPrompt()` to strip JanitorAI instructions and inject custom prompt
+- Stashes raw system prompt for recast before extensions modify it
 - Calls `primeTreeName()` before the extension pipeline
 - Calls `applyPromptCaching()` for Claude models
-- Runs `transformRequest` pipeline
+- 3-phase `transformRequest` pipeline (pre-RAG/TV → RAG+TV parallel → post-RAG/TV)
 - Calls `wrapSendWithToolLoop()` or `sendToOpenRouter()` directly
+- Caches raw reply before recast via `reply-cache.js`
 - Runs `transformResponse` pipeline
-- Log rotation (5MB cap, 7-day archive)
-- Memory monitoring (warn at 400MB, restart at 600MB)
+- Caches final reply after recast via `reply-cache.js`
+- Bot log and duplicate detection run post-transform (logs show final text)
+- Log rotation (5MB cap, 7-day archive, checked every 5 minutes)
+- Async log file writes (non-blocking)
+- Memory monitoring (warn at 512MB throttled to once per 5 min, restart at 768MB)
 - Graceful shutdown on SIGTERM/SIGINT
 - Dashboard bundle rebuild on startup via `execSync('node dashboard/build.js')`
 
@@ -129,7 +152,8 @@ POST /v1/chat/completions
 ```js
 START_TIME       // server start timestamp
 lastRequestTime  // ISO string of last request
-lastReply        // it now compares post-transform text.
+lastReply        // post-transform text for duplicate detection
+lastMemoryWarn   // timestamp of last memory warning (throttle)
 RESTART_HISTORY  // array of { time, reason } restart records
 ```
 
@@ -138,15 +162,22 @@ RESTART_HISTORY  // array of { time, reason } restart records
 2. Sort by `priority` (ascending)
 3. Mount any `router` properties at `/extensions/<filename>/`
 
+**3-phase transformRequest pipeline:**
+- Phase 1: Extensions with priority < 25 (before RAG/TV)
+- Phase 2: RAG + TunnelVision run in parallel via `Promise.allSettled`, results merged (RAG provides messages, TV provides tools)
+- Phase 3: Extensions with priority >= 25 (after RAG/TV, excluding RAG/TV themselves)
+
 **What can go wrong:**
 - If an extension fails to load, it's skipped with a warning — the proxy still starts
 - If `primeTreeName` crashes, TunnelVision won't work for that request
 - If the dashboard bundle fails to build, the old bundle is used (non-fatal)
 - Memory monitoring uses `setInterval(30s)` — a spike between checks won't trigger restart
+- Memory warnings are throttled to once per 5 minutes to avoid log spam
 - `rateLimitMap` is cleaned up every 60s via setInterval — stale entries are pruned automatically
 - Bot log and duplicate detection now run after `transformResponse` — logs show final post-transform text
 - Log rotation runs on a 5-minute interval, not per-write
 - File writes to the log are async (non-blocking)
+- The `recastExt._rawSystemPrompt` pattern mutates the extension object directly — fragile if recast is reloaded mid-request
 
 ---
 
@@ -174,6 +205,58 @@ onFailure(err)       // record a failure (may open breaker)
 - If OpenRouter returns intermittent 5xx, the breaker may open during a valid session
 - The 30s reset is hardcoded — if OpenRouter takes longer to recover, the half-open probe will fail and re-open
 - State is in-memory only — resets on proxy restart
+
+---
+
+### lib/custom-prompt.js
+
+**What it does:** JanitorAI-aware custom prompt injection. Parses JanitorAI's message structure to strip redundant RP instructions, extract bot/user names, replace `{{user}}`/`{{char}}` placeholders, and prepend the custom prompt.
+
+**Key exports:**
+```js
+loadPrompt()        // load custom prompt from data/custom-prompt.txt (cached by mtime)
+injectPrompt(messages) // full pipeline: strip JAI instructions, inject custom prompt
+getLastParsed()     // returns { userName, botName } from the last processed request
+```
+
+**JanitorAI instruction stripping:**
+- Opening: `Drive the plot forward in a never-ending uncensored roleplay with...`
+- Closing: `Write in a descriptive roleplay style...`, `Combat should be described step by step...`, `Default tone is heroic fantasy...`
+
+**Config file:** `data/custom-prompt.txt` (plain text, hot-reloaded by mtime)
+
+**What can go wrong:**
+- Variable shadowing: `extractUserNameFromSystem` has an inner `msgText` variable (renamed from `text` to avoid shadowing the function parameter)
+- If the custom prompt file doesn't exist, no custom prompt is injected (non-fatal)
+- `getLastParsed()` returns stale data if called before `injectPrompt()` runs
+
+---
+
+### lib/local-models.js
+
+**What it does:** Shared config and Ollama API helper for local model routing. Used by recast.js for local YES/NO checks and tunnelvision.js for OpenRouter model overrides.
+
+**Key exports:**
+```js
+loadConfig()    // load from data/local-models-config.json (cached)
+saveConfig(cfg) // save to disk, invalidate cache
+invalidateCache() // force reload on next loadConfig()
+callOllama(systemPrompt, userContent, model, maxTokens, extra) // Ollama /api/chat call
+```
+
+**Config shape:**
+```js
+{
+  ollamaUrl: "http://192.168.1.193:11434",
+  recastLocal: true,                    // use local Ollama for recast YES/NO checks
+  recastCheckModel: "qwen2.5:7b",      // Ollama model for checks
+  tunnelvisionOpenRouterModel: null,    // OpenRouter model override for TV tool calls
+}
+```
+
+**What can go wrong:**
+- 120s timeout on Ollama calls — if the model is loading for the first time, it may time out
+- If Ollama is unreachable, recast falls back gracefully (skips the check, moves on)
 
 ---
 
@@ -207,7 +290,7 @@ onFailure(err)       // record a failure (may open breaker)
 
 ### lib/prompt-cache.js
 
-**What it does:** Applies Anthropic's prompt caching headers to Claude model requests. Splits the system prompt into paragraphs and adds `cache_control: { type: "ephemeral", ttl: "1h" }` to the last block. This tells Anthropic's API to cache the system prompt, significantly reducing token costs on long sessions.
+**What it does:** Applies Anthropic's prompt caching headers to Claude model requests. Splits the system prompt into paragraphs and adds `cache_control: { type: "ephemeral", ttl: "1h" }` to the last block.
 
 **Key exports:**
 ```js
@@ -239,12 +322,6 @@ enqueue()   // returns Promise<doneFn> — call doneFn() when request completes
 getStats()  // { active, waiting, totalQueued, totalProcessed, totalTimedOut }
 ```
 
-**How it works:**
-1. `enqueue()` pushes a `{ resolve, reject, queuedAt }` item to the queue
-2. `next()` checks if a slot is available — if yes, resolves the oldest item with a `done` callback
-3. Caller must call `done()` when their request finishes to free the slot
-4. If a request waited longer than 60s, it's rejected with 408
-
 **What can go wrong:**
 - If `done()` is never called (exception before the call), the slot is leaked and the queue will eventually fill
 - `index.js` wraps everything in try/catch and calls `done?.()` in the catch block, so this should be rare
@@ -263,17 +340,14 @@ embedBatch(texts, config)    // string[] → (number[]|null)[]
 EMBEDDING_DIM                // 1024
 ```
 
-**Config required:** `{ ollamaUrl, ollamaModel }`
-
 **Important limits:**
-- 30s timeout per embedding call (`AbortSignal.timeout(30_000)`)
+- 30s timeout per embedding call
 - Empty/blank text throws immediately (doesn't call Ollama)
 - `mxbai-embed-large` has a ~512 token context window — callers truncate to ~1800 chars before calling
 
 **What can go wrong:**
 - If Ollama container (192.168.1.193) is down, all RAG operations fail silently (logged as warnings, non-fatal)
 - Uses Node.js native `fetch` (Node 18+)
-- Ollama `/api/embed` returns `{ embeddings: [[...]] }` — if the shape changes, the extractor breaks
 
 ---
 
@@ -283,40 +357,44 @@ EMBEDDING_DIM                // 1024
 
 **Key exports:**
 ```js
-indexTurn(params, config)   // store a conversation turn in Qdrant
-retrieve(params, config)    // query Qdrant and return formatted context string
-sanitizeCollectionName(name) // sanitize char name for Qdrant collection naming
+indexTurn(params, config)          // store a conversation turn in Qdrant
+retrieve(params, config)           // query and return { context, coCharacters }
+retrieveLinked(params, config)     // retrieve for co-occurring characters (reduced topK)
+sanitizeCollectionName(name)       // sanitize char name for Qdrant collection naming
 ```
 
 **Scoring pipeline (retrieve):**
 1. Embed the query text (last N user messages joined)
 2. Search Qdrant for top `topK * 2` candidates
-3. For each hit:
-   - Apply temporal decay: `score × max(floor, 0.5^(age/halfLife))` (exponential) or linear
-   - Apply keyword boost: +0.05 per matching keyword, capped at +0.20
-   - Apply emotion boost: +`emotionBoost` if chunk emotion matches current scene emotion
+3. For each hit: temporal decay → keyword boost → emotion boost
 4. Filter by `scoreThreshold`
 5. Apply conditional rules (emotion/keyword/recency conditions)
 6. Sort descending, take top `topK`
 7. Deduplicate by character-level similarity (>85% = duplicate)
-8. Format as `[Relevant Memory Context]\nUser: ...\nCharacter: ...\n[End Memory Context]`
+8. Collect co-characters from top hits for cross-character linking
+
+**Cross-character linking:**
+- `retrieve()` returns `coCharacters` — other character names found in top chunks' `coCharacters` arrays
+- `retrieveLinked()` performs a secondary retrieval for co-occurring characters with reduced `linkedTopK` (default 2)
+- This allows RAG to surface relevant memories from related characters' collections
 
 **indexTurn params:**
 ```js
 {
-  charName,       // character name (used for collection namespacing)
-  userText,       // the user's message
-  assistantText,  // the AI's reply (emotion tag already stripped)
-  messageIndex,   // position in conversation
-  emotion,        // detected emotion label
-  temporallyBlind // if true, skip decay for this chunk (always retrieved at full score)
+  charName,        // character name (used for collection namespacing)
+  userText,        // the user's message
+  assistantText,   // the AI's reply (emotion tag already stripped)
+  messageIndex,    // position in conversation
+  emotion,         // detected emotion label
+  temporallyBlind, // if true, skip decay for this chunk
+  coCharacters,    // other characters active in the same turn
 }
 ```
 
 **What can go wrong:**
 - If Qdrant is unreachable, `retrieve()` returns null and `indexTurn()` logs a warning — both are non-fatal
-- The `similarity()` dedup function is a fast positional approximation — exact duplicates may slip through if text is shifted
-- Temporal decay is calculated from `messageIndex` stored at index time vs `currentIndex` at retrieval time — if message count resets (new session), old chunks may appear with wrong ages
+- The `similarity()` dedup function is a fast positional approximation — not perfect but good enough
+- Temporal decay uses `messageIndex` — if message count resets (new session), old chunks may appear with wrong ages
 
 ---
 
@@ -330,18 +408,62 @@ ensureCollection(collection, config)           // create if not exists (idempote
 upsertPoint(collection, point, config)         // store a single vector + payload
 queryPoints(collection, vector, topK, config)  // cosine similarity search
 getPointCount(collection, config)              // count points in a collection
-makePointId(charName, messageIndex, role)      // deterministic numeric ID
+makePointId(charName, messageIndex, role)       // deterministic numeric ID
 ```
 
-**Point ID generation:**
-- `makePointId` generates a deterministic hash from `charName:messageIndex:role`
-- This means re-indexing the same turn overwrites the existing point (upsert behavior)
-- IDs are positive integers scaled to avoid JS integer overflow
+**What can go wrong:**
+- `makePointId` uses bitwise ops — unexpected values for very long char names (unlikely with sanitization)
+- `ensureCollection` does a GET check before PUT — race condition if two requests try to create the same collection simultaneously (rare)
+- All operations throw on non-OK responses — callers wrap in try/catch
+
+---
+
+### lib/reply-cache.js
+
+**What it does:** Catches and caches the last successful reply for recovery and reroll optimization.
+
+**Key exports:**
+```js
+cacheRaw(reply, userText)    // cache raw reply before recast runs
+cacheFinal(reply)            // cache final reply after recast passes
+shouldSkipRecast(userText)   // true if reroll of a previously passed reply
+getLast()                    // get last cached reply (for /v1/last-reply endpoint)
+```
+
+**Persistence:** Writes to `data/reply-cache.json` asynchronously. Loaded from disk on startup.
 
 **What can go wrong:**
-- Qdrant requires `unsigned 64-bit integer` IDs — the hash function uses bitwise ops that can produce unexpected values for very long char names
-- `ensureCollection` does a `GET` check before `PUT` — race condition if two requests try to create the same collection simultaneously (rare)
-- All operations throw on non-OK responses — callers in `rag-retriever.js` wrap in try/catch
+- Cache is a single slot — only the most recent reply is stored
+- If the proxy crashes between `cacheRaw` and `cacheFinal`, the raw reply is still recoverable
+
+---
+
+### lib/character-detector.js
+
+**What it does:** Shared character name extraction used by RAG, prose-polisher, and TunnelVision. Single source of truth for name detection, alias resolution, and false positive blocklisting.
+
+**Key exports:**
+```js
+extractCharNames(replyText, userName, opts)  // extract character names from AI reply
+extractUserName(messages)                     // extract user name from JanitorAI messages
+resolveAlias(name)                            // resolve alias to canonical name
+loadAliases()                                 // load alias map from data/character-aliases.json
+BLOCKLIST                                     // Set of blocked false-positive words
+```
+
+**Extraction flow:**
+1. Scan for multi-word aliases ("All Might" → "toshinori") — longest first, greedy
+2. Remove matched multi-word aliases from text to prevent re-detection as individual words
+3. Run single-word patterns: possessive (`Kurt's`), action verb (`Kurt stepped`), dialogue attribution (`"text," Kurt said`)
+4. Resolve single-word aliases and merge with multi-word results
+5. Deduplicate, blocklist filter, return lowercase canonical names
+
+**Config file:** `data/character-aliases.json` (hot-reloaded by mtime)
+
+**What can go wrong:**
+- First-person narration won't trigger name extraction (relies on third-person patterns)
+- Very common names that happen to match blocklist entries will be filtered out
+- Multi-word aliases must be exact matches (case-insensitive but otherwise literal)
 
 ---
 
@@ -356,7 +478,7 @@ makePointId(charName, messageIndex, role)      // deterministic numeric ID
   charName:    string,         // sanitized lowercase
   nodes:       { [id]: Node }, // flat id→node map
   rootId:      "root",         // always exists
-  summariesId: "summaries",   // always exists
+  summariesId: "summaries",    // always exists
   nextUid:     number,         // auto-increment for entry UIDs
   createdAt:   number,
   updatedAt:   number,
@@ -375,35 +497,70 @@ makePointId(charName, messageIndex, role)      // deterministic numeric ID
 ```js
 {
   uid, title, content, keys,
-  enabled, createdAt, updatedAt
+  enabled, isTracker, createdAt, updatedAt
 }
 ```
+
+**Diagnostics (`runDiagnostics`):** Auto-fixes orphaned nodes, stale child references, missing summaries node, and nextUid inconsistencies. Reports duplicate UIDs, empty entries, and oversized entries.
 
 **Key exports:**
 ```js
 // I/O
-loadTree(charName)          // load from disk or null
-saveTree(tree)              // write to disk (auto-updates updatedAt)
-getOrCreateTree(charName)   // load or create fresh
-createTree(charName)        // create with root + summaries nodes
-deleteTree(charName)        // delete file from disk
-listTrees()                 // list all .json filenames (without extension)
+loadTree, saveTree, getOrCreateTree, createTree, deleteTree, listTrees, sanitizeCharName
 
 // Node ops
-addNode(tree, parentId, label, opts)   // add child node, saves tree
-removeNode(tree, nodeId)               // remove node + descendants, orphan entries to root
-moveNode(tree, nodeId, newParentId)    // reparent a node
-getNode(tree, nodeId)                  // returns node or null
-walkTree(tree, fn, startId)            // depth-first traversal
+addNode, removeNode, moveNode, getNode, walkTree
+
+// Entry ops
+addEntry, findEntry, updateEntry, disableEntry, moveEntry, getAllEntries
+
+// Tree overview / retrieval
+buildTreeOverview, retrieveNodeContent
+
+// Dedup
+trigramSimilarity, findSimilarEntries
+
+// Summaries arcs
+getOrCreateArc
+
+// Diagnostics
+runDiagnostics
 ```
 
 ---
+
+### lib/tunnelvision/tv-tools.js
+
+**What it does:** Defines all 8 TunnelVision tools and their action handlers.
+
+**Tools:**
+
+| Tool | Description |
+|------|-------------|
+| `TunnelVision_Search` | Navigate tree and retrieve entries (collapsed or traversal mode) |
+| `TunnelVision_Remember` | Create new entry with trigram dedup warning |
+| `TunnelVision_Update` | Edit existing entry by UID |
+| `TunnelVision_Forget` | Soft-delete entry by UID |
+| `TunnelVision_Summarize` | Create scene summary under arc node |
+| `TunnelVision_Notebook` | Private scratchpad (write/delete/clear/promote) |
+| `TunnelVision_MergeSplit` | Merge two entries or split one into two |
+| `TunnelVision_Reorganize` | Move entries/nodes, create new channels |
+
+**Search modes:**
+- **Collapsed** (< `TRAVERSAL_THRESHOLD` nodes): Full tree overview in tool description, AI picks node IDs in one call
+- **Traversal** (>= `TRAVERSAL_THRESHOLD` nodes): Shows only current level, AI drills down step by step
+
+**Tracker entries:** Entries with `isTracker: true` or title starting with `[Tracker]` are listed in tool descriptions as reminders to check/update them.
+
+---
+
+## Extensions
 
 ### extensions/ooc.js
 
 **Priority:** 10 | **Hooks:** `transformRequest`
 
-Handles out-of-character (OOC) messages from JanitorAI. Strips or routes OOC content before it reaches the model so it doesn't contaminate the roleplay context.
+Handles out-of-character (OOC) messages from JanitorAI. Detects `(OOC: ...)` in the last user message, strips it from context, and injects it as a temporary system instruction. The OOC command never reaches the AI as a user message.
 
 **Config file:** none  
 **Routes:** none
@@ -414,22 +571,9 @@ Handles out-of-character (OOC) messages from JanitorAI. Strips or routes OOC con
 
 **Priority:** 20 | **Hooks:** `transformResponse` | **Routes:** `/extensions/regex/*`
 
-**What it does:** SillyTavern-compatible regex post-processor. Runs an ordered list of find/replace rules against every AI reply.
+SillyTavern-compatible regex post-processor. Runs an ordered list of find/replace rules against every AI reply. Features: in-memory cache with dirty flag, `stopOnMatch`, script groups/tags, named capture groups, `dryRun` mode, per-script hit counters.
 
-**Script processing:**
-1. Load scripts from `data/regex-scripts.json`
-2. For each enabled script, call `applyScript(text, script)`
-3. `parseRegex()` handles both plain patterns and `/pattern/flags` format
-4. `{{match}}` in replaceString is converted to `$&` (full match reference)
-5. `trimStrings: true` trims whitespace from result
-
-**Routes:** See `EXTENSIONS.md` for full route reference.
-
-**What can go wrong:**
-- Scripts are cached in memory with a dirty flag — disk reads only happen on first load
-- Invalid regexes are rejected at creation/update/import time with a 400 error. If a script somehow has an invalid regex at runtime, it silently returns the original text unchanged.
-- Scripts run in order — a script that modifies text can affect subsequent scripts
-- `transformResponse` returns a new object — never mutates the original response body
+**Config file:** `data/regex-scripts.json`
 
 ---
 
@@ -437,44 +581,35 @@ Handles out-of-character (OOC) messages from JanitorAI. Strips or routes OOC con
 
 **Priority:** 25 | **Hooks:** `transformRequest`, `transformResponse` | **Routes:** `/extensions/rag/*`
 
-**What it does:** Semantic memory via Qdrant + Ollama. Full details in `EXTENSIONS.md`.
+Semantic memory via Qdrant + Ollama. Full details in `EXTENSIONS.md`.
 
 **State carried between hooks:**
 ```js
 // Per-request state (transformRequest → transformResponse)
 _pendingMap = Map<reqId, {
-  userText,    // last user message (for indexing)
-  msgCount,    // message count (for decay calculation)
-  userName,    // user's name (for pronoun blocklisting)
-  isReroll,    // true if same user message as last turn
+  userText, msgCount, userName, isReroll, timestamp
 }>
 
-// Cross-turn state (persists across requests)
+// Cross-turn state (persists across requests, 30min TTL)
 _turnState = {
-  lastCharNames, // accumulated character names from all turns
-  lastEmotion,   // emotion from previous turn
-  lastUserText,  // for reroll detection
+  lastCharNames,     // accumulated character names from all turns (capped at 15)
+  activeSceneChars,  // chars from the LAST reply only (used for next retrieval)
+  lastEmotion,       // emotion from previous turn
+  lastUserText,      // for reroll detection
 }
 ```
 
-**Emotion flow:**
-1. `transformRequest` injects `EMOTION_INSTRUCTION` into system prompt
-2. Model prepends `<emotion>LABEL</emotion>` to its reply
-3. `transformResponse` extracts and strips the tag before JanitorAI sees it
-4. Emotion is stored with the indexed turn for future boost calculations
+**Scene-aware retrieval:** Only characters from the last reply (`activeSceneChars`) are used for retrieval on the next turn. Falls back to all known characters on first turn. User-mentioned characters that are already known are also included.
 
-**Character name extraction:**
-- Looks for `Name's ` possessive or `Name <action verb>` at start of lines
-- Blocklists pronouns and the user's own name
-- Falls back to last known name if extraction fails
-- Names are sanitized for Qdrant collection naming
+**Cross-character linking:** When retrieved chunks mention other known characters, those characters' memories are also retrieved with reduced topK.
+
+**Collection pruning:** When the number of RAG collections exceeds `maxCollections` (default 20), the smallest collections are automatically deleted.
 
 **What can go wrong:**
-- Cross-turn state (`_turnState`) is still module-level — concurrent sessions with different characters would share accumulated names. Single-user usage avoids this.
-- Per-request state uses `_pendingMap` with TTL cleanup — concurrent requests no longer overwrite each other's indexing data.
-- Character name extraction relies on the AI starting sentences with the character's name — may fail for first-person narration
-- If Ollama is slow, `transformRequest` blocks the entire request pipeline while waiting for the embedding
-- `blindNextTurn` flag is written to disk and reset after use — if the proxy crashes between the write and the reset, it stays true permanently
+- `knownCharNames` is now copied from `_turnState` arrays (not a direct reference) — the old splice-based mutation was fragile
+- Cross-turn state (`_turnState`) is module-level — concurrent sessions with different characters would share state
+- Per-request state uses `_pendingMap` with TTL cleanup and hard cap of 3 entries
+- `blindNextTurn` flag is reset asynchronously after use
 
 ---
 
@@ -482,23 +617,7 @@ _turnState = {
 
 **Priority:** 30 | **Hooks:** `transformRequest` | **Routes:** `/extensions/samplers/*`
 
-**What it does:** Injects sampler parameters (Top P, Top K, etc.) into outgoing requests based on saved config. Model-aware — Claude only gets `top_p` and `top_k`.
-
-**Model family detection:**
-- `claude` / `anthropic` → `"claude"` family → only `top_p`, `top_k`
-- `gpt` / `openai` / `o1` / `o3` → `"openai"` family → full set
-- Anything else → `"other"` family → full set
-
-**Merge behavior:**
-```js
-return { ...payload, ...params };
-```
-Configured sampler values override JanitorAI defaults. Disable a sampler in the dashboard to let JanitorAI's value through.
-
-**What can go wrong:**
-- Config is loaded from disk on every request — no caching
-- If `min_p` is enabled and Claude is the model, it's silently skipped (correct behavior, but confusing if you forget)
-- The merge puts `params` first, so JanitorAI can override any sampler value
+Model-aware sampler controls. Config is cached in memory (warm cache after save).
 
 ---
 
@@ -506,69 +625,23 @@ Configured sampler values override JanitorAI defaults. Disable a sampler in the 
 
 **Priority:** 40 | **Hooks:** `transformRequest`, `transformResponse`
 
-**What it does:** Server-side repetition avoidance. Tracks n-grams (3 to `ngramMax` words) across responses. Builds a frequency + score map over time. Injects a style note into the system prompt listing the most overused phrases.
+Server-side repetition avoidance with per-character n-gram tracking. Uses shared `lib/character-detector.js` for name extraction. Session char accumulator with 30min TTL reset. Config and state cached in memory.
 
-**Scoring factors per n-gram hit:**
-- Base: `+1.0`
-- Length bonus: `+(n-3) × 0.2` (longer phrases score higher)
-- Uncommon word bonus: `+0.5` per word not in COMMON_WORDS
-- Blacklist bonus: configurable per-phrase weights
-- Not in dialogue: `×1.25` multiplier (narration repetition penalized more)
-
-**Decay:** Applied every `decayInterval` messages. Each n-gram's score is multiplied by `(1 - decayRate/100)^cycles` where cycles = how many intervals since last seen.
-
-**State files:**
-- `data/prose-polisher-config.json` — thresholds, weights, whitelist, blacklist
-- `data/prose-polisher-state.json` — live ngram frequency map
-
-**What can go wrong:**
-- State is loaded and saved synchronously on every response — adds latency at high message counts
-- The state file can grow large over long sessions (many unique n-grams)
-- `stripMarkup()` removes code blocks and HTML — if roleplay uses heavy markdown, this may strip too aggressively
-- The injected slop list is in `transformRequest`, which runs before RAG context injection — so the slop note may be in the middle of a long system prompt
+**Config file:** `data/prose-polisher-config.json`  
+**State file:** `data/prose-polisher-state.json`
 
 ---
 
 ### extensions/tunnelvision.js
 
-**Priority:** 26 | **Hooks:** `transformRequest`, `transformResponse` | **Routes:** `/extensions/tunnelvision/*`
+**Priority:** 26 | **Hooks:** `transformRequest` | **Routes:** `/extensions/tunnelvision/*`
 
-**What it does:** Hierarchical lorebook memory via real Claude tool calls. Injects tool definitions into requests, runs the tool call loop, and manages the active tree.
+Hierarchical lorebook memory via real Claude tool calls. Supports local model routing via `lib/local-models.js` — tool calls can use a separate OpenRouter model override.
 
-**Bot name extraction:**
-- Looks for `<BotName's Persona>` tag in the system message
-- Pattern: `/<([A-Za-z][A-Za-z0-9 '_-]{0,39})'s Persona>/`
-- Sanitizes the name with `sanitizeCharName()` for use as a filename
-
-**Tool loop (`runToolLoop`):**
-1. Send payload to OpenRouter
-2. Check `finish_reason === "tool_calls"`
-3. If tool calls present: execute against tree, append results, repeat
-4. Cap at `MAX_TOOL_ROUNDS` (6) — forces `tool_choice: "none"` on final round
-5. Return first non-tool-call response
-
-**`primeTreeName(messages)`:**
-- Called from `index.js` BEFORE the extension pipeline
-- Ensures the tree is loaded before `rag.js` or other extensions modify messages
-- Sets `_pendingTreeName` for use in `transformRequest` and `wrapSendWithToolLoop`
-
-**`wrapSendWithToolLoop(payload, sendFn)`:**
-- Called from `index.js` instead of `sendToOpenRouter` directly
-- Only activates if TunnelVision tools are present in the payload
-- Falls back to direct `sendFn` if no tree is loaded
-
-**State:**
-```js
-_pendingTreeName  // module-level, set by primeTreeName, used by wrapSendWithToolLoop
-_pendingTreeName  // set by primeTreeName, used by transformRequest + wrapSendWithToolLoop
-_pendingTree      // cached tree reference, avoids redundant disk reads
-_configCache      // config cached in memory, invalidated on save
-```
-
-**What can go wrong:**
-- `_pendingTreeName` is module-level — concurrent requests overwrite each other (same problem as RAG's `_pending`)
-- If `primeTreeName` doesn't find a `<BotName's Persona>` tag, TunnelVision won't activate for that request
-- The tool loop appends to `messages` on each round — very deep tool call chains create long context
+**Search mode selection:**
+- `auto` (default): collapsed if < 15 nodes, traversal if >= 15
+- `collapsed`: always show full tree overview
+- `traversal`: always drill-down navigation
 
 ---
 
@@ -576,217 +649,55 @@ _configCache      // config cached in memory, invalidated on save
 
 **Priority:** 45 | **Hooks:** `transformRequest`, `transformResponse` | **Routes:** `/extensions/recast/*`
 
-**What it does:** "The 4 Steps of Roleplay" — a background quality-control pipeline. Runs last in the pipeline after all other extensions. Each step judges the fully post-processed reply with a fast YES/NO check. On failure, a rewrite pass runs and the check repeats up to `maxRetries` times. The final output silently replaces the reply before JanitorAI sees it.
+"The 4 Steps of Roleplay" quality-control pipeline. Supports local Ollama models for YES/NO checks (via `lib/local-models.js`) and OpenRouter for rewrites. Features consecutive pass streak tracking — steps that pass consistently are auto-skipped.
 
-**The 4 Steps:**
+**TunnelVision integration:** Pulls character entries and summaries from TunnelVision trees for character authenticity checks (step 2).
 
-| Step | Name | Checks |
-|------|------|--------|
-| 1 | System Prompt Compliance | Format rules, response header, acoustic payload mandate, show-don't-tell, forbidden elements |
-| 2 | Characters | Voice, speech patterns, personality consistency, proportional emotional reactions |
-| 3 | World | Physical/causal coherence, no retcons, persistent environment, time/resource realism |
-| 4 | Story Progression | Narrative momentum, no stagnation, no unearned intensity jumps, scene closure law |
-
-**State carried between hooks:**
-```js
-_pending = {
-  model,        // request model string (fallback if no checkModel/rewriteModel set)
-  systemPrompt, // longest system message (original character card + framework)
-  charCard,     // extracted character card block (with fallbacks for untagged cards)
-  userPersona,  // extracted user persona block (with fallbacks)
-  messages,     // full messages array for recent context extraction
-}
-```
-
-**Character card extraction (with fallbacks):**
-1. `<CharName's Persona>...</CharName's Persona>` — JanitorAI standard tagged format
-2. `<CharName>...</CharName>` — bare inner tag only
-3. First 3000 chars of system prompt — covers all untagged cards (character info always leads)
-
-**User persona extraction (with fallbacks):**
-1. `<UserPersona>...</UserPersona>` — standard tag
-2. Last 500 chars of system prompt — JanitorAI always appends persona at the bottom
-
-**Routes:** See `EXTENSIONS.md` for full route and config reference.
-
-**What can go wrong:**
-- `_pending` is module-level — concurrent requests overwrite each other's stashed context (same issue as rag.js and tunnelvision.js). Reduce `MAX_CONCURRENT` to 1 in `lib/queue.js` if this causes problems.
-- Each failed step costs 2 extra OpenRouter calls (rewrite + recheck). Worst case with 4 steps and `maxRetries: 2` is 12 extra calls per response. Always set `checkModel` to a cheap fast model.
-- If `checkModel` returns prose instead of YES/NO, it will never match `startsWith('YES')` and will always trigger rewrites. Use a model that reliably follows short instructions.
-- Recast runs synchronously in `transformResponse` — the full pipeline must complete before the response is returned to JanitorAI. Long rewrite chains will noticeably delay responses.
+**Reroll optimization:** Uses `reply-cache.js` to skip recast on rerolls when the previous reply already passed all checks.
 
 ---
+
+## Dashboard
 
 ### dashboard/index.html
 
-**What it does:** The single-page dashboard HTML shell. Contains all modals, tab panels, and stat card markup. Loads CSS and JS from separate files.
-
-**Tabs:** Overview, Logs, Settings
-
-**Modals:**
-- `#msg-modal` — full message text viewer
-- `#script-modal` — regex script editor
-- `#tv-entry-modal` — TunnelVision add entry
-- `#tv-node-modal` — TunnelVision add channel
-
-**Script load order** (bottom of body — must be in this order):
-1. `dashboard-core.js` — defines `esc()`, clock, tabs, init
-2. `dashboard-overview.js` — `fetchStats()`, `fetchHealth()`
-3. `dashboard-logs.js` — `fetchLogs()`, `renderLogs()`
-4. `dashboard-samplers.js` — `fetchSamplers()`, `drawGraph()`
-5. `dashboard-regex.js` — `fetchRegexScripts()`
-6. `dashboard-rag.js` — `fetchRagStatus()`
-7. `dashboard-tunnelvision.js` — `fetchTvStatus()`, `fetchTvTrees()`
-
-**What can go wrong:**
-- Script load order matters — `esc()` from `core.js` is used by all other files
-- In production, `dashboard.bundle.js` replaces all 7 script tags — if the bundle is stale, old code runs
-
----
+The single-page dashboard HTML shell with Frutiger Aero / glassmorphism aesthetic.
 
 ### dashboard/dashboard.css
 
-**What it does:** All styles for the dashboard. Frutiger Aero / glassmorphism aesthetic. Uses CSS variables from the body background for consistency.
-
-**Key design tokens:**
-- Glass cards: `rgba(255,255,255,0.62)` background, `blur(14px)` backdrop filter
-- Primary gradient: `#1060a0` → `#0d9e8a` → `#1878c0`
-- Success green: `#00d97e`
-- Error red: `#ff4444`
-- Warning orange: `#ffa500`
-
----
+All styles. Glass cards with `blur(14px)` backdrop filter, aurora background, floating particles.
 
 ### dashboard/build.js
 
-**What it does:** Concatenates all 7 dashboard JS files into `dashboard/dashboard.bundle.js` in the correct load order. Run automatically on proxy startup.
-
-**File order (hardcoded):**
-```js
-const FILES = [
-  'js/dashboard-core.js',
-  'js/dashboard-overview.js',
-  'js/dashboard-logs.js',
-  'js/dashboard-samplers.js',
-  'js/dashboard-regex.js',
-  'js/dashboard-rag.js',
-  'js/dashboard-tunnelvision.js',
-];
-```
-
-**Adding a new JS file:** Add it to the `FILES` array in the correct position, then restart the proxy.
-
-**What can go wrong:**
-- If a file is missing, it's skipped with a warning and the bundle continues without it
-- The bundle is auto-generated — never edit `dashboard.bundle.js` directly
-
----
+Concatenates 7 dashboard JS files into `dashboard.bundle.js` in correct load order. Run on startup.
 
 ### dashboard/js/dashboard-core.js
 
-**What it does:** Bubble background animation, clock (America/New_York timezone), tab switching, proxy restart, and the shared `esc()` HTML escaping helper.
-
-**Global functions exposed:**
-```js
-esc(s)              // HTML-escape a string — used by all other dashboard files
-switchTab(name, btn) // switch visible tab + trigger data fetches
-restartProxy()      // POST /dashboard/restart
-updateClock()       // update clock display (runs every 1s)
-```
-
-**Init calls (bottom of file):**
-```js
-fetchStats();   // from dashboard-overview.js
-fetchHealth();  // from dashboard-overview.js
-setInterval(fetchStats, 30000);
-setInterval(fetchHealth, 10000);
-```
-
----
+Bubble background animation, clock (America/New_York), tab switching, `esc()` helper.
 
 ### dashboard/js/dashboard-overview.js
 
-**What it does:** Fetches and renders the stats cards and health/extensions panel on the Overview tab.
-
-**Functions:**
-```js
-fetchStats()   // reads /dashboard/logs, computes today's stats
-fetchHealth()  // reads /health, renders uptime + extension chips
-formatUptime(s) // seconds → "Xh Ym" string
-```
-
----
+Stats cards and health/extensions panel.
 
 ### dashboard/js/dashboard-logs.js
 
-**What it does:** Log viewer with type filters, pagination, expandable entries, and message preview modal.
-
-**State:**
-```js
-activeFilters  // Set of active filter types
-allLogs        // raw + parsed log array (reversed)
-curPage        // current pagination page
-msgStore       // { key: fullMessageText } for modal
-```
-
-**Functions:**
-```js
-fetchLogs()         // GET /dashboard/logs
-renderLogs()        // filter + paginate + render
-toggleFilter(type)  // toggle filter pill
-clearLogs()         // DELETE /dashboard/logs
-openModal(title, key) // show full message in modal
-```
-
----
+Log viewer with type filters, pagination, expandable entries.
 
 ### dashboard/js/dashboard-samplers.js
 
-**What it does:** Sampler sliders UI with model selector and live token probability graph.
-
-**Functions:**
-```js
-fetchSamplers()   // GET /extensions/samplers/config?model=...
-renderSamplers()  // build slider DOM elements
-onSlider()        // update value displays + redraw graph
-saveSamplers()    // POST /extensions/samplers/config
-drawGraph()       // canvas-based probability distribution visualization
-```
-
----
+Sampler sliders UI with model selector and live probability graph.
 
 ### dashboard/js/dashboard-regex.js
 
-**What it does:** Regex script manager — list, create, edit, delete, toggle, reorder, import/export, and live test.
-
-**State:**
-```js
-rxScripts    // current scripts array
-rxEditingId  // ID of script being edited in modal (null = new)
-```
-
----
+Regex script manager — CRUD, reorder, import/export, live test.
 
 ### dashboard/js/dashboard-rag.js
 
-**What it does:** RAG controls — enable/disable toggle, blind next turn, collections list with clear, and config sliders.
-
-**State:**
-```js
-_ragConfig  // current config object (loaded from /extensions/rag/status)
-```
-
----
+RAG controls — enable/disable, blind next turn, collections list, config sliders.
 
 ### dashboard/js/dashboard-tunnelvision.js
 
-**What it does:** TunnelVision status, tree list, tree editor with expandable nodes/entries, and add channel/entry modals.
-
-**State:**
-```js
-_tvEditorName    // name of tree currently being edited
-_tvEditorNodeId  // node ID for add-entry modal context
-```
+TunnelVision tree editor with expandable nodes/entries.
 
 ---
 
@@ -794,14 +705,18 @@ _tvEditorNodeId  // node ID for add-entry modal context
 
 | File | Owner | Description |
 |------|-------|-------------|
+| `data/custom-prompt.txt` | custom-prompt.js | Custom system prompt (plain text, hot-reloaded) |
+| `data/character-aliases.json` | character-detector.js | Multi-word and single-word alias map |
 | `data/regex-scripts.json` | regex.js | Ordered array of regex script objects |
 | `data/rag-config.json` | rag.js | RAG configuration including Qdrant/Ollama URLs |
 | `data/sampler-config.json` | samplers.js | Per-sampler enabled + value settings |
 | `data/prose-polisher-config.json` | prose-polisher.js | Thresholds, decay rates, whitelist, blacklist |
-| `data/prose-polisher-state.json` | prose-polisher.js | Live n-gram frequency map |
-| `data/tunnelvision-config.json` | tunnelvision.js | Active tree override, auto-detect flag |
+| `data/prose-polisher-state.json` | prose-polisher.js | Live n-gram frequency map (deletable to reset) |
+| `data/tunnelvision-config.json` | tunnelvision.js | Active tree override, search mode, auto-detect flag |
 | `data/tunnelvision/<charName>.json` | tv-tree.js | One tree per character, auto-created |
 | `data/recast-config.json` | recast.js | Step enable flags, model overrides, retry cap |
+| `data/local-models-config.json` | local-models.js | Ollama URL, recast/TV model routing |
+| `data/reply-cache.json` | reply-cache.js | Last raw + final reply for recovery |
 | `logs/requests.log` | index.js | JSONL request log, rotated at 5MB |
 
 **Important:** The `data/` folder is excluded from Git. Back it up separately.
@@ -816,7 +731,6 @@ _tvEditorNodeId  // node ID for add-entry modal context
 - Check that `data/` directory exists and is writable
 
 **Dashboard shows blank / CSS not loading**
-- Check that `app.use('/dashboard', express.static(...))` is in `index.js`
 - Check that `dashboard/dashboard.bundle.js` was built (look for `[proxy] ✦ Dashboard bundle built` in logs)
 
 **TunnelVision not activating**
@@ -828,7 +742,8 @@ _tvEditorNodeId  // node ID for add-entry modal context
 - Check Qdrant is reachable: `curl http://192.168.1.192:6333/health`
 - Check Ollama is reachable: `curl http://192.168.1.193:11434/api/tags`
 - Check `data/rag-config.json` — `enabled` must be `true`
-- First message of a new session won't inject (char name is "unknown" until first response)
+- First message of a new session won't inject (no characters known until first response)
+- Check for junk collections (common words as names) — delete via dashboard
 
 **Circuit breaker keeps opening**
 - OpenRouter is returning 5xx errors repeatedly
@@ -836,31 +751,32 @@ _tvEditorNodeId  // node ID for add-entry modal context
 - Check your API key is valid and has credits
 - The breaker resets after 30s automatically
 
-**Memory keeps hitting 600MB / frequent restarts**
-- A very long roleplay session is the most common cause
+**Memory keeps hitting threshold / frequent restarts**
+- Warning threshold is 512MB, restart threshold is 768MB
+- Long roleplay sessions are the most common cause
 - TunnelVision's tool loop appends to messages each round — check `MAX_TOOL_ROUNDS`
-- Prose Polisher state file may have grown large — delete `data/prose-polisher-state.json` to reset
+- Delete `data/prose-polisher-state.json` to reset accumulated n-gram data
+- Clean up junk RAG collections via dashboard
 
 **Regex scripts not applying**
 - Check `data/regex-scripts.json` — scripts must have `enabled: true`
 - Check the regex pattern is valid — invalid patterns silently return original text
-- Remember `transformResponse` runs AFTER TunnelVision strips its tags
+- `transformResponse` runs in priority order — regex (20) runs before recast (45)
 
 **Concurrent request issues (wrong character names, wrong tree)**
 - rag.js uses `_pendingMap` for per-request state (safe) but `_turnState` for cross-turn state (shared)
 - tunnelvision.js uses `_pendingTreeName` and `_pendingTree` which are module-level
 - recast.js uses `_pending` which is module-level (documented as single-user safe)
-- If two roleplay sessions run simultaneously, they share state
-- The queue (`MAX_CONCURRENT = 3`) reduces but doesn't eliminate this
 - Workaround: reduce `MAX_CONCURRENT` to 1 in `lib/queue.js`
 
 **Recast keeps rewriting / responses are very slow**
-- Check that `checkModel` is set to a fast cheap model (e.g. `anthropic/claude-haiku-4-5`)
-- If left blank, recast uses the main request model for checks — expensive for a 100-token YES/NO call
-- Lower `maxRetries` in `data/recast-config.json` to reduce worst-case extra calls
-- Disable individual steps via `data/recast-config.json` if one step is consistently failing
+- Default: local Ollama `qwen2.5:7b` for YES/NO checks (fast, free)
+- If `recastLocal` is false, set `checkModel` to a fast cheap model
+- Lower `maxRetries` to reduce worst-case extra calls
+- Disable individual steps if one is consistently failing
+- Check for consecutive pass streak skipping (`skipAfterPasses` config)
 
-**Recast always failing a step / infinite rewrites hitting cap**
-- The check model may be ignoring the YES/NO instruction and writing prose — switch models
-- The check prompt for that step may be too strict for your writing style — temporarily disable that step and re-enable after adjusting `maxRetries` down to 1
-- Check proxy logs for `[recast] ⚠` lines to see exactly which step is failing and why
+**Recast always failing a step**
+- The check model may be writing prose instead of YES/NO — switch models
+- The step's check prompt may be too strict — lower `maxRetries` to 1 or disable the step
+- Check proxy logs for `[recast] ⚠` lines to identify the failing step

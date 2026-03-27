@@ -40,16 +40,23 @@ The proxy scans `extensions/` at startup, sorts by priority, and mounts any rout
 ```
 JanitorAI → POST /v1/chat/completions
                ↓
-         transformRequest   (all extensions, priority order)
+         injectPrompt()       (strip JanitorAI instructions, inject custom prompt)
+               ↓
+         transformRequest     (3-phase pipeline)
+           Phase 1: priority < 25 (ooc)
+           Phase 2: RAG + TunnelVision in parallel
+           Phase 3: priority >= 25, excl. RAG/TV (samplers, prose-polisher, recast)
                ↓
          OpenRouter API call (+ TunnelVision tool loop if active)
                ↓
-         transformResponse  (all extensions, priority order)
+         transformResponse    (all extensions, priority order)
                ↓
          res.json → JanitorAI
 ```
 
 Each hook is `async` and receives the full payload/response. If a hook throws, the error is caught and logged — the pipeline continues with the previous value unchanged.
+
+**Important:** RAG and TunnelVision run in parallel during Phase 2. RAG modifies messages (system prompt content) while TunnelVision adds tools. Results are merged: messages from RAG, tools from TunnelVision.
 
 ---
 
@@ -86,17 +93,26 @@ const DEFAULT_CONFIG = {
   someOption: 42,
 };
 
+let _configCache = null;
+
 function loadConfig() {
+  if (_configCache) return _configCache;
   try {
     if (fs.existsSync(CONFIG_PATH)) {
       const saved = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-      return { ...DEFAULT_CONFIG, ...saved };
+      _configCache = { ...DEFAULT_CONFIG, ...saved };
+      return _configCache;
     }
   } catch (e) {
     console.warn('[my-extension] Failed to load config:', e.message);
   }
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(DEFAULT_CONFIG, null, 2));
-  return { ...DEFAULT_CONFIG };
+  _configCache = { ...DEFAULT_CONFIG };
+  return _configCache;
+}
+
+function saveConfig(config) {
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+  _configCache = config; // keep cache warm
 }
 
 // ── Hooks ──────────────────────────────────────────────────
@@ -107,6 +123,7 @@ async function transformRequest(payload) {
 
   // Modify payload.messages, payload.model, etc.
   // Must return the (modified) payload object.
+  // Never mutate the original — return { ...payload, ... }
   return payload;
 }
 
@@ -116,6 +133,7 @@ async function transformResponse(data) {
 
   // Modify data.choices[0].message.content, etc.
   // Must return the (modified) data object.
+  // Never mutate the original — return a new object.
   return data;
 }
 
@@ -129,7 +147,7 @@ router.get('/status', (req, res) => {
 router.post('/config', (req, res) => {
   try {
     const updated = { ...loadConfig(), ...req.body };
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(updated, null, 2));
+    saveConfig(updated);
     res.json({ ok: true, config: updated });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -159,7 +177,7 @@ Called before the request is sent to OpenRouter. Receives and must return the fu
 ```js
 // payload shape
 {
-  model:    string,           // e.g. 'anthropic/claude-opus-4-5'
+  model:    string,           // e.g. 'anthropic/claude-opus-4-6'
   messages: Array<{
     role:    'system' | 'user' | 'assistant',
     content: string | Array,  // may be string or content block array
@@ -170,6 +188,8 @@ Called before the request is sent to OpenRouter. Receives and must return the fu
 ```
 
 Common uses: inject system prompt additions, modify messages, add sampler params, prepend context.
+
+**Important:** Never mutate the incoming payload directly. Always return a new object: `return { ...payload, messages: newMessages }`.
 
 #### `transformResponse(data) → data`
 
@@ -196,6 +216,8 @@ Called after a successful response from OpenRouter (after all tool loop rounds f
 
 Common uses: post-process reply text (regex, stripping tags), index turn data, update state.
 
+**Important:** Never mutate the incoming data directly. Return a new object with spread syntax.
+
 ---
 
 ### Config Persistence
@@ -207,7 +229,11 @@ const saved = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
 return { ...DEFAULT_CONFIG, ...saved }; // saved values win, new defaults fill gaps
 ```
 
-Never mutate config in memory across requests without writing to disk — the proxy can restart at any time.
+**Best practices:**
+- Cache config in memory (`_configCache`) to avoid disk reads per request
+- After saving, set `_configCache = config` to keep the cache warm (avoids unnecessary re-read)
+- Use `fs.writeFile` (async) for writes that happen in the request hot path
+- Use `fs.writeFileSync` only for config saves from dashboard routes (where the response depends on the write completing)
 
 ---
 
@@ -228,18 +254,22 @@ Standard Express router — use `router.get`, `router.post`, `router.put`, `rout
 
 Lower number = runs earlier in the pipeline.
 
-| Priority | Extension         |
-|----------|-------------------|
-| 10       | ooc.js            |
-| 20       | regex.js          |
-| 25       | rag.js            |
-| 26       | tunnelvision.js   |
-| 30       | samplers.js       |
-| 40       | prose-polisher.js |
-| 45       | recast.js         |
+| Priority | Extension         | Phase |
+|----------|-------------------|-------|
+| 10       | ooc.js            | 1 (pre-RAG/TV) |
+| 20       | regex.js          | 1 (pre-RAG/TV, response only) |
+| 25       | rag.js            | 2 (parallel) |
+| 26       | tunnelvision.js   | 2 (parallel) |
+| 30       | samplers.js       | 3 (post-RAG/TV) |
+| 40       | prose-polisher.js | 3 (post-RAG/TV) |
+| 45       | recast.js         | 3 (post-RAG/TV) |
 
-`transformRequest` runs lowest → highest (10 first, 45 last).  
-`transformResponse` runs in the same order (10 first, 45 last).
+**transformRequest** runs in 3 phases:
+- Phase 1: priority < 25 (before RAG/TV)
+- Phase 2: RAG (25) + TunnelVision (26) in parallel
+- Phase 3: priority >= 25, excluding RAG/TV
+
+**transformResponse** runs in standard priority order (lowest first).
 
 Pick a priority that makes sense relative to others. Leave gaps between values so you can insert new extensions without renumbering.
 
@@ -259,7 +289,7 @@ The dashboard's **Settings → Proxy Controls → Restart** also triggers a full
 
 **Priority:** 10 | **Hooks:** `transformRequest`
 
-Handles out-of-character (OOC) messages from JanitorAI. Strips or routes OOC content before it reaches the model so it doesn't contaminate the roleplay context.
+Handles out-of-character (OOC) messages from JanitorAI. Detects `(OOC: ...)` patterns in the last user message, strips them from context, and injects all commands as a single temporary system instruction. Multiple OOC commands in one message are combined with semicolons.
 
 **Config file:** none  
 **Routes:** none
@@ -270,7 +300,7 @@ Handles out-of-character (OOC) messages from JanitorAI. Strips or routes OOC con
 
 **Priority:** 20 | **Hooks:** `transformResponse` | **Routes:** `/extensions/regex/*`
 
-SillyTavern-compatible regex post-processor. Runs an ordered list of find/replace rules against every AI reply after generation. Supports full regex flags, `trimStrings`, per-script enable/disable, and ST JSON import/export.
+SillyTavern-compatible regex post-processor. Runs an ordered list of find/replace rules against every AI reply after generation. In-memory script cache with dirty flag (no disk read per response).
 
 **Config file:** `data/regex-scripts.json`
 
@@ -280,7 +310,7 @@ SillyTavern-compatible regex post-processor. Runs an ordered list of find/replac
   id:            string,   // timestamp-based unique ID
   description:   string,   // human-readable label
   findRegex:     string,   // regex pattern (or /pattern/flags format)
-  replaceString: string,   // replacement string, supports $1 capture groups
+  replaceString: string,   // replacement string, supports $1 capture groups + {{match}}
   flags:         string,   // regex flags e.g. 'g', 'gi'
   trimStrings:   boolean,  // trim whitespace from result
   enabled:       boolean,
@@ -290,11 +320,19 @@ SillyTavern-compatible regex post-processor. Runs an ordered list of find/replac
 }
 ```
 
+**Features:**
+- Test-before-apply (skip scripts that don't match)
+- `stopOnMatch` flag to halt the chain
+- `dryRun` mode for debugging
+- Per-script hit counters (in-memory, visible in dashboard)
+- Group enable/disable by tag
+- SillyTavern JSON import/export compatibility
+
 **Routes:**
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET`    | `/scripts`          | List all scripts |
+| `GET`    | `/scripts`          | List all scripts (with live hit counts) |
 | `POST`   | `/scripts`          | Create a new script |
 | `PUT`    | `/scripts/:id`      | Update a script |
 | `DELETE` | `/scripts/:id`      | Delete a script |
@@ -335,15 +373,24 @@ Scoring pipeline: cosine similarity → temporal decay → keyword boost → emo
   decayHalfLife:     number,   // messages until relevance halves
   decayFloor:        number,   // minimum relevance after decay (0–1)
   decayMode:         'exponential' | 'linear',
-  maxInjectionChars: number,   // cap on injected context length
+  maxInjectionChars: number,   // shared budget across all character blocks
   emotionEnabled:    boolean,
   emotionBoost:      number,   // score boost when emotion matches (0–0.5)
   blindNextTurn:     boolean,  // if true, next indexed turn is decay-immune
+  maxCollections:    number,   // auto-prune smallest when cap is hit (default 20)
   rules:             Array,    // conditional activation rules
 }
 ```
 
 **Emotion detection:** Injects an `<emotion>LABEL</emotion>` instruction into the system prompt. The tag is automatically extracted and stripped from the reply before JanitorAI sees it. Valid labels: `neutral, happy, sad, angry, fearful, tender, anxious, excited, surprised, disgusted`.
+
+**Scene-aware retrieval:** Only characters from the last reply (`activeSceneChars`) are used for retrieval. Falls back to all known characters on first turn. User-mentioned characters that are already known are merged in.
+
+**Cross-character linking:** When retrieved chunks mention other known characters (via `coCharacters` payload), those characters' memories are retrieved with reduced topK. Injection budget is shared across all blocks.
+
+**Collection pruning:** When collections exceed `maxCollections`, the smallest (fewest points) are deleted automatically after indexing.
+
+**Reroll detection:** If the user message is identical to the previous turn, indexing is skipped to avoid duplicate entries.
 
 **Routes:**
 
@@ -351,7 +398,7 @@ Scoring pipeline: cosine similarity → temporal decay → keyword boost → emo
 |--------|------|-------------|
 | `GET`    | `/status`              | Config + live stats |
 | `POST`   | `/config`              | Update config |
-| `GET`    | `/collections`         | List Qdrant collections |
+| `GET`    | `/collections`         | List Qdrant collections with point counts |
 | `DELETE` | `/collections/:name`   | Clear a character's memory |
 | `POST`   | `/blind-next`          | Mark next turn as temporally blind |
 
@@ -361,22 +408,48 @@ Scoring pipeline: cosine similarity → temporal decay → keyword boost → emo
 
 **Priority:** 26 | **Hooks:** `transformRequest` | **Routes:** `/extensions/tunnelvision/*`
 
-Hierarchical lorebook memory via real Claude tool calls. Maintains a tree of knowledge nodes (channels) and entries per bot character. Claude can search, read, create, and update entries during generation via a tool loop (up to 6 rounds per request).
+Hierarchical lorebook memory via real Claude tool calls. Maintains a tree of knowledge nodes (channels) and entries per bot character. Claude can search, read, create, update, merge, split, reorganize, and summarize entries during generation via a tool loop (up to 6 rounds per request).
 
-**Config file:** `data/tunnelvision-config.json`  
+**Config file:** `data/tunnelvision-config.json`
+
+```js
+{
+  enabled:            boolean,
+  activeTree:         string | null,  // override tree name (null = auto-detect)
+  autoDetect:         boolean,        // extract bot name from system prompt
+  injectContext:      boolean,
+  maxContextChars:    number,
+  searchMode:         'auto' | 'collapsed' | 'traversal',
+  traversalThreshold: number,         // node count threshold for traversal mode (default 15)
+}
+```
+
 **Tree files:** `data/tunnelvision/<botname>.json` (one per character, auto-created)
+
+**Tool loop flow:**
+1. `primeTreeName()` called from `index.js` before extension pipeline
+2. `transformRequest` loads tree, injects tool definitions
+3. `wrapSendWithToolLoop()` replaces `sendToOpenRouter()` — runs up to 6 tool rounds
+4. Each round: send to OpenRouter → extract tool calls → execute against tree → append results → repeat
+5. Final round: forces `tool_choice: "none"` for narrative response
+
+**Model override:** If `tunnelvisionOpenRouterModel` is set in `data/local-models-config.json`, tool calls use that model via a custom `sendFn` that bypasses account-level provider preferences.
+
+**8 Tools:** Search, Remember, Update, Forget, Summarize, Notebook, MergeSplit, Reorganize
 
 **Routes:**
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET`    | `/status`                                    | Config + active tree stats |
-| `POST`   | `/config`                                    | Update config (mandatoryTools, autoSummary, autoSummaryInterval, activeTree) |
-| `GET`    | `/trees`                                     | List all trees |
-| `GET`    | `/tree/:name`                                | Get full tree data |
-| `DELETE` | `/tree/:name`                                | Delete a tree |
-| `POST`   | `/tree/:name/node`                           | Add a channel node |
-| `POST`   | `/tree/:name/node/:nodeId/entry`             | Add an entry to a node |
+| `GET`    | `/status`                    | Config + active tree stats |
+| `POST`   | `/config`                    | Update config |
+| `GET`    | `/trees`                     | List all trees with stats |
+| `GET`    | `/tree/:name`                | Get full tree data |
+| `GET`    | `/tree/:name/overview`       | Get tree overview text |
+| `DELETE` | `/tree/:name`                | Delete a tree |
+| `POST`   | `/tree/:name/node`           | Add a channel node |
+| `GET`    | `/tree/:name/diagnostics`    | Run diagnostic checks |
+| `POST`   | `/tree/:name/diagnostics`    | Run diagnostic checks (POST alias) |
 
 ---
 
@@ -384,12 +457,12 @@ Hierarchical lorebook memory via real Claude tool calls. Maintains a tree of kno
 
 **Priority:** 30 | **Hooks:** `transformRequest` | **Routes:** `/extensions/samplers/*`
 
-Model-aware sampler controls. Applies enabled sampler parameters (Top P, Top K, temperature, etc.) to outgoing requests. Claude via OpenRouter only supports Top P and Top K — the UI reflects this automatically.
+Model-aware sampler controls. Applies enabled sampler parameters (Top P, Top K, Min P, penalties) to outgoing requests. Claude via OpenRouter only supports Top P and Top K — unsupported samplers are silently skipped.
 
 **Config file:** `data/sampler-config.json`
 
 ```js
-// Config shape — keyed by model string
+// Config shape — keyed by sampler name
 {
   top_p:              { enabled: boolean, value: number },
   top_k:              { enabled: boolean, value: number },
@@ -399,13 +472,17 @@ Model-aware sampler controls. Applies enabled sampler parameters (Top P, Top K, 
   repetition_penalty: { enabled: boolean, value: number },
 }
 ```
-```
+
+**Model family detection:**
+- `claude` / `anthropic` → only `top_p`, `top_k`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`
+- `gpt` / `openai` / `o1` / `o3` → full set
+- Anything else → full set
 
 **Routes:**
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET`  | `/config?model=...` | Get sampler defs + current config for a model |
+| `GET`  | `/config?model=...` | Get sampler defs + current config for a model family |
 | `POST` | `/config`           | Save sampler config |
 
 ---
@@ -414,10 +491,25 @@ Model-aware sampler controls. Applies enabled sampler parameters (Top P, Top K, 
 
 **Priority:** 40 | **Hooks:** `transformRequest`, `transformResponse`
 
-Server-side repetition avoidance. Tracks n-grams across responses with exponential decay and penalises repeated phrases. Regex-aware to avoid false positives on structured content. Helps keep long roleplay sessions feeling fresh without manual intervention.
+Server-side repetition avoidance. Tracks n-grams (3 to `ngramMax` words) across responses with per-character pools and a global pool. Uses exponential decay to age out old patterns. Injects a style note listing overused phrases into the system prompt.
 
 **Config file:** `data/prose-polisher-config.json`  
 **State file:** `data/prose-polisher-state.json`
+
+**Scoring factors per n-gram hit:**
+- Base: `+1.0`
+- Length bonus: `+(n-3) × 0.2` (longer phrases score higher)
+- Uncommon word bonus: `+0.5` per word not in COMMON_WORDS
+- Blacklist bonus: configurable per-phrase weights
+- Not in dialogue: `×1.25` multiplier
+
+**Features:**
+- Per-character n-gram tracking (each character gets their own frequency map)
+- Global pool for scene-wide patterns
+- Session char accumulator with 30min TTL reset
+- Lemmatization for common verbs/nouns (reduces false negatives)
+- Low-quality filter (skips phrases with common names, all-common-words)
+- Config and state cached in memory (async state writes)
 
 **Routes:** none
 
@@ -427,7 +519,7 @@ Server-side repetition avoidance. Tracks n-grams across responses with exponenti
 
 **Priority:** 45 | **Hooks:** `transformRequest`, `transformResponse` | **Routes:** `/extensions/recast/*`
 
-"The 4 Steps of Roleplay" — a background quality-control pipeline that runs after every AI response. Each step judges the reply with a fast YES/NO check call. On failure, a rewrite pass runs and the check repeats. A configurable retry cap prevents infinite loops. The final output silently replaces the original reply before JanitorAI sees it.
+"The 4 Steps of Roleplay" — a background quality-control pipeline that runs after every AI response. Each step judges the fully post-processed reply with a fast YES/NO check call. On failure, a rewrite pass runs and the check repeats. A configurable retry cap prevents infinite loops.
 
 Runs last in the pipeline (priority 45) so it checks the fully post-processed reply after all other extensions have had their turn.
 
@@ -435,17 +527,25 @@ Runs last in the pipeline (priority 45) so it checks the fully post-processed re
 
 | Step | Name | Checks |
 |------|------|--------|
-| 1 | System Prompt Compliance | Format rules, response header, acoustic payload mandate, show-don't-tell, forbidden elements |
-| 2 | Characters | Voice, speech patterns, personality consistency, proportional emotional reactions |
+| 1 | System Prompt Compliance | User sovereignty (no writing for user character), scene closure (no philosophical summaries), format (double quotes on dialogue) |
+| 2 | Characters | Voice, speech patterns, personality consistency, proportional emotional reactions. Uses TunnelVision lorebook data if available. |
 | 3 | World | Physical/causal coherence, no retcons, persistent environment, time/resource realism |
 | 4 | Story Progression | Narrative momentum, no stagnation, no unearned intensity jumps, scene closure law |
 
 **Check flow per step:**
 ```
-Check (YES/NO) → PASS: move to next step
-              → FAIL: Rewrite → Recheck → PASS: move on
+Check (YES/NO) → PASS: increment streak, move to next step
+              → FAIL: reset streak, Rewrite → Recheck → PASS: move on
                               → FAIL again: retry up to maxRetries, then pass through
 ```
+
+**Consecutive pass streaks:** Steps that pass `skipAfterPasses` times in a row are auto-skipped. Streak resets on any failure.
+
+**Local model support:** YES/NO checks can use local Ollama models (via `lib/local-models.js`) when `recastLocal: true`. Rewrites always use OpenRouter.
+
+**TunnelVision integration:** Pulls character entries and story summaries from the active TunnelVision tree for step 2 (Characters) checks and rewrites.
+
+**Reroll optimization:** Uses `reply-cache.js` to skip the entire recast pipeline on rerolls when the previous reply already passed all checks.
 
 **Character card extraction** (with fallbacks for untagged cards):
 1. `<CharName's Persona>...</CharName's Persona>` — JanitorAI standard
@@ -456,17 +556,19 @@ Check (YES/NO) → PASS: move to next step
 1. `<UserPersona>...</UserPersona>` — standard tag
 2. Last 500 chars of system prompt — JanitorAI always appends user persona at the bottom
 
+**Raw system prompt:** Recast uses the system prompt stashed by `index.js` before extensions modified it (via `_rawSystemPrompt`). This ensures checks run against the original character card, not the RAG/TunnelVision-augmented version.
+
 **Config file:** `data/recast-config.json`
 
 ```js
-// Config shape
 {
-  enabled:       boolean,  // master on/off
-  maxRetries:    number,   // max rewrite attempts per step before giving up (default: 2)
-  checkModel:    string,   // model for YES/NO checks — '' = use request model
-  rewriteModel:  string,   // model for rewrites — '' = use request model
-  checkTokens:   number,   // max tokens for check responses (default: 100)
-  rewriteTokens: number,   // max tokens for rewrite responses (default: 2048)
+  enabled:          boolean,  // master on/off
+  maxRetries:       number,   // max rewrite attempts per step (default: 2)
+  checkModel:       string,   // model for YES/NO checks — '' = use request model
+  rewriteModel:     string,   // model for rewrites — '' = use request model
+  checkTokens:      number,   // max tokens for check responses (default: 100)
+  rewriteTokens:    number,   // max tokens for rewrite responses (default: 2048)
+  skipAfterPasses:  number,   // auto-skip step after N consecutive passes (0 = never)
   steps: {
     step1: { enabled: boolean, name: string, description: string },
     step2: { enabled: boolean, name: string, description: string },
@@ -477,9 +579,9 @@ Check (YES/NO) → PASS: move to next step
 ```
 
 **Recommended model config:**
-- `checkModel`: a fast cheap model — e.g. `anthropic/claude-haiku-4-5` (checks need ~100 tokens)
-- `rewriteModel`: a stronger model — e.g. `anthropic/claude-sonnet-4-6` (rewrites need quality)
-- Both default to the request model if left blank
+- `recastLocal: true` + `recastCheckModel: "qwen2.5:7b"` in `data/local-models-config.json` (fast, free checks)
+- `rewriteModel`: a strong model — e.g. `anthropic/claude-sonnet-4-6` (rewrites need quality)
+- If not using local models, set `checkModel` to a fast cheap model like `anthropic/claude-haiku-4-5`
 
 **Routes:**
 
@@ -493,16 +595,18 @@ Check (YES/NO) → PASS: move to next step
 ```
 [recast] ✦ Finished response! Checking message through 4 steps...
 [recast] 🔍 Doing check 1 — Step 1 — System Prompt Compliance...
-[recast] ✅ Step 1 — System Prompt Compliance — PASSED! Moving to next check...
-[recast] 🔍 Doing check 2 — Step 2 — Characters...
-[recast] ❌ Step 2 — Characters — FAILED! Rewriting... (attempt 1/2)
-[recast] ✏  Step 2 — Characters — Rewrite done. Rechecking...
-[recast] ✅ Step 2 — Characters — PASSED! Moving to next check...
+[recast] ✅ Step 1 — System Prompt Compliance — PASSED! Moving to next check... (streak: 3)
+[recast] ⏭  Step 2 — Characters — skipped (5 consecutive passes)
+[recast] 🔍 Doing check 3 — Step 3 — World...
+[recast] ❌ Step 3 — World — FAILED! Rewriting... (attempt 1/2)
+[recast] ✏  Step 3 — World — Rewrite done. Rechecking...
+[recast] ✅ Step 3 — World — PASSED! Moving to next check... (streak: 1)
 [recast] 🎉 All checks done! Sending message to JanitorAI.
 ```
 
 **What can go wrong:**
-- `_pending` is module-level — concurrent requests will overwrite each other's stashed context (same issue as rag.js and tunnelvision.js). Reduce `MAX_CONCURRENT` to 1 if this causes problems.
-- Each failed step costs 2 extra API calls (rewrite + recheck). With 4 steps and `maxRetries: 2`, worst case is 12 extra calls per response. Set `checkModel` to a cheap/fast model to limit cost.
-- If `checkModel` is slow, the entire response pipeline blocks while recast runs. Haiku-class models are strongly recommended for checks.
-- Step checks are binary — a model that ignores the YES/NO instruction and writes prose will never match `startsWith('YES')` and will always trigger rewrites. If this happens, switch to a model that follows short instructions reliably.
+- `_pending` is module-level — concurrent requests will overwrite each other's stashed context. Reduce `MAX_CONCURRENT` to 1 if this causes problems.
+- Each failed step costs 2 extra API calls (rewrite + recheck). With 4 steps and `maxRetries: 2`, worst case is 12 extra calls per response.
+- If the check model writes prose instead of YES/NO, it will never match `startsWith('YES')` and will always trigger rewrites.
+- Recast runs synchronously in `transformResponse` — the full pipeline must complete before the response is returned to JanitorAI.
+- The emotion tag stripping at the end of recast catches cases where a rewrite re-introduces the `<emotion>` tag.
