@@ -15,7 +15,6 @@ const {
   getStatus: getBreakerStatus,
 } = require("./lib/circuit-breaker");
 const registerDashboardRoutes = require("./lib/dashboard-routes");
-const replyCache = require("./lib/reply-cache");
 const { injectPrompt } = require("./lib/custom-prompt");
 
 // ── Build dashboard bundle on startup ─────────────────────
@@ -335,12 +334,6 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ── Reply recovery endpoint ────────────────────────────────
-app.get("/v1/last-reply", (req, res) => {
-  const cached = replyCache.getLast();
-  res.json({ ok: true, ...cached });
-});
-
 // ── Dashboard routes ───────────────────────────────────────
 registerDashboardRoutes(app, {
   LOG_FILE,
@@ -420,18 +413,6 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     // ── Inject custom system prompt (also strips JanitorAI instructions) ──
     payload.messages = injectPrompt(payload.messages);
-
-    // ── Stash raw system prompt for recast (before extensions modify it)
-    const recastExt = extensions.find((e) => e.filename === "recast.js");
-    if (recastExt) {
-      const sysMsg = payload.messages.find(m => m.role === "system");
-      const rawPrompt = typeof sysMsg?.content === "string"
-        ? sysMsg.content
-        : Array.isArray(sysMsg?.content)
-          ? sysMsg.content.map(b => b.text || "").join("\n\n")
-          : "";
-      recastExt._rawSystemPrompt = rawPrompt;
-    }
     
     // ── Pre-extract bot name for TunnelVision before extensions transform messages
     const tvExt = extensions.find((e) => e.filename === "tunnelvision.js");
@@ -551,15 +532,6 @@ app.post("/v1/chat/completions", async (req, res) => {
       });
     }
 
-// ── Cache raw reply before recast runs ─────────────────
-    const rawReply = result.data?.choices?.[0]?.message?.content;
-    const lastUserMsgText = typeof lastUserMsg?.content === "string"
-      ? lastUserMsg.content
-      : (lastUserMsg?.content?.[0]?.text ?? "");
-    if (rawReply) {
-      replyCache.cacheRaw(rawReply, lastUserMsgText);
-    }
-
     // ── Run transformResponse pipeline ─────────────────────
     let finalData = result.data;
     for (const ext of extensions) {
@@ -589,11 +561,6 @@ app.post("/v1/chat/completions", async (req, res) => {
       cache_read: usage?.prompt_tokens_details?.cached_tokens,
       char: typeof finalReply === "string" ? finalReply.slice(0, 300) : null,
     });
-
-   // ── Cache final reply after pipeline ───────────────────
-    if (finalReply) {
-      replyCache.cacheFinal(finalReply);
-    }
 
     // ── Duplicate response detection ───────────────────────
     if (lastReply && finalReply && typeof finalReply === "string") {
