@@ -177,7 +177,7 @@ const MAX_TOOL_ROUNDS = 6;
 
 async function runToolLoop(payload, tree, sendFn) {
   const lm = localModels.loadConfig();
-  const useLocal = lm.enabled;
+  const useLocal = lm.tunnelvisionLocal;
 
   // Strip cache_control blocks — Ollama doesn't support them
   let currentPayload = { ...payload };
@@ -493,7 +493,13 @@ async function wrapSendWithToolLoop(payload, sendFn) {
   );
   if (!hasTVTools) return sendFn(payload);
 
-  return runToolLoop(payload, tree, sendFn);
+  // Override model for TV tool calls if configured
+  const lm = localModels.loadConfig();
+  const tvPayload = lm.tunnelvisionOpenRouterModel
+    ? { ...payload, model: lm.tunnelvisionOpenRouterModel }
+    : payload;
+
+  return runToolLoop(tvPayload, tree, sendFn);
 }
 
 module.exports = {

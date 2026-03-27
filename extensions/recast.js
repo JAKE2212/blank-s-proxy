@@ -432,7 +432,7 @@ async function runStep(stepKey, stepNumber, reply, vars, config, requestModel) {
     let verdict = "";
     try {
       const lm = localModels.loadConfig();
-      if (lm.enabled) {
+      if (lm.recastLocal) {
         verdict = await localModels.callOllama(
           "You are a strict but fair quality-control judge. Answer only YES or NO.",
           checkPrompt,
