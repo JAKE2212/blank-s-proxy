@@ -25,6 +25,7 @@ const DEFAULT_CONFIG = {
   rewriteModel: "", // model for rewrites       ('' = use request model)
   checkTokens: 100, // max tokens for check responses
   rewriteTokens: 2048, // max tokens for rewrite responses
+  skipAfterPasses: 5, // skip a step after N consecutive passes (0 = never skip)
 
   steps: {
     step1: {
@@ -259,6 +260,9 @@ RESPONSE TO FIX:
 // Single-slot — safe for single-user, would need a map for concurrent requests
 let _pending = null;
 
+// Track consecutive pass streaks per step
+const _passStreaks = { step1: 0, step2: 0, step3: 0, step4: 0 };
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 let _configCache = null;
@@ -415,6 +419,13 @@ async function runStep(stepKey, stepNumber, reply, vars, config, requestModel) {
     return reply;
   }
 
+  // Skip steps that have been passing consistently
+  const skipAfter = config.skipAfterPasses ?? 0;
+  if (skipAfter > 0 && _passStreaks[stepKey] >= skipAfter) {
+    console.log(`[recast] ⏭  ${label} — skipped (${_passStreaks[stepKey]} consecutive passes)`);
+    return reply;
+  }
+
   console.log(`[recast] 🔍 Doing check ${stepNumber} — ${label}...`);
 
   const checkModel = config.checkModel || requestModel;
@@ -458,9 +469,13 @@ async function runStep(stepKey, stepNumber, reply, vars, config, requestModel) {
     const passed = verdict.toUpperCase().startsWith("YES");
 
     if (passed) {
-      console.log(`[recast] ✅ ${label} — PASSED! Moving to next check...`);
+      _passStreaks[stepKey]++;
+      console.log(`[recast] ✅ ${label} — PASSED! Moving to next check... (streak: ${_passStreaks[stepKey]})`);
       return current;
     }
+
+    // Failed — reset the streak
+    _passStreaks[stepKey] = 0;
 
     if (attempt === maxRetries) {
       console.warn(
@@ -531,6 +546,17 @@ async function transformResponse(data) {
 
   const originalReply = data?.choices?.[0]?.message?.content;
   if (!originalReply || typeof originalReply !== "string") return data;
+
+  // Skip recast on rerolls if the previous reply already passed all checks
+  const replyCache = require("../lib/reply-cache");
+  const userText = typeof _pending.messages?.findLast?.(m => m.role === "user")?.content === "string"
+    ? _pending.messages.findLast(m => m.role === "user").content
+    : "";
+  if (replyCache.shouldSkipRecast(userText)) {
+    console.log("[recast] ⏭  Skipping — reroll of a previously passed reply");
+    _pending = null;
+    return data;
+  }
 
   const vars = {
     systemPrompt: _pending.systemPrompt,

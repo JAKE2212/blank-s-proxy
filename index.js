@@ -16,6 +16,7 @@ const {
 } = require("./lib/circuit-breaker");
 const registerDashboardRoutes = require("./lib/dashboard-routes");
 const { extractUserName } = require("./lib/character-detector");
+const replyCache = require("./lib/reply-cache");
 
 // ── Build dashboard bundle on startup ─────────────────────
 const { execSync } = require("child_process");
@@ -334,6 +335,12 @@ app.get("/health", (req, res) => {
   });
 });
 
+// ── Reply recovery endpoint ────────────────────────────────
+app.get("/v1/last-reply", (req, res) => {
+  const cached = replyCache.getLast();
+  res.json({ ok: true, ...cached });
+});
+
 // ── Dashboard routes ───────────────────────────────────────
 registerDashboardRoutes(app, {
   LOG_FILE,
@@ -445,8 +452,67 @@ app.post("/v1/chat/completions", async (req, res) => {
     }
 
     // ── Run through extension pipeline ─────────────────────
+    // RAG and TunnelVision run in parallel since they modify different
+    // parts of the payload (RAG = system prompt content, TV = tools).
+    // All other extensions run sequentially in priority order.
     let transformedPayload = payload;
+
+    const ragExt = extensions.find(e => e.filename === "rag.js");
+    const tvExtPipeline = extensions.find(e => e.filename === "tunnelvision.js");
+    const parallelSet = new Set(["rag.js", "tunnelvision.js"]);
+
+    // Phase 1: Run extensions BEFORE RAG/TV (priority < 25)
     for (const ext of extensions) {
+      if (parallelSet.has(ext.filename)) continue;
+      if ((ext.priority ?? 50) >= 25) continue;
+      if (ext.transformRequest) {
+        try {
+          transformedPayload = await ext.transformRequest(transformedPayload);
+        } catch (e) {
+          writeLog({
+            event: "error",
+            message: `[extensions] ${ext.name ?? ext.filename} transformRequest failed: ${e.message}`,
+          });
+        }
+      }
+    }
+
+    // Phase 2: Run RAG + TunnelVision in parallel
+    if (ragExt?.transformRequest || tvExtPipeline?.transformRequest) {
+      const parallelPayload = { ...transformedPayload };
+      const [ragResult, tvResult] = await Promise.allSettled([
+        ragExt?.transformRequest
+          ? ragExt.transformRequest({ ...parallelPayload })
+          : Promise.resolve(parallelPayload),
+        tvExtPipeline?.transformRequest
+          ? tvExtPipeline.transformRequest({ ...parallelPayload })
+          : Promise.resolve(parallelPayload),
+      ]);
+
+      // Merge results: RAG modifies messages (system prompt content), TV adds tools
+      const ragPayload = ragResult.status === "fulfilled" ? ragResult.value : parallelPayload;
+      const tvPayload = tvResult.status === "fulfilled" ? tvResult.value : parallelPayload;
+
+      if (ragResult.status === "rejected") {
+        writeLog({ event: "error", message: `[extensions] RAG transformRequest failed: ${ragResult.reason?.message}` });
+      }
+      if (tvResult.status === "rejected") {
+        writeLog({ event: "error", message: `[extensions] TunnelVision transformRequest failed: ${tvResult.reason?.message}` });
+      }
+
+      // Take messages from RAG (has injected memory context)
+      // Take tools + tool_choice from TV (has injected tool definitions)
+      transformedPayload = {
+        ...ragPayload,
+        tools: tvPayload.tools ?? ragPayload.tools,
+        tool_choice: tvPayload.tool_choice ?? ragPayload.tool_choice,
+      };
+    }
+
+    // Phase 3: Run extensions AFTER RAG/TV (priority > 26)
+    for (const ext of extensions) {
+      if (parallelSet.has(ext.filename)) continue;
+      if ((ext.priority ?? 50) < 25) continue;
       if (ext.transformRequest) {
         try {
           transformedPayload = await ext.transformRequest(transformedPayload);
@@ -497,6 +563,15 @@ app.post("/v1/chat/completions", async (req, res) => {
       });
     }
 
+// ── Cache raw reply before recast runs ─────────────────
+    const rawReply = result.data?.choices?.[0]?.message?.content;
+    const lastUserMsgText = typeof lastUserMsg?.content === "string"
+      ? lastUserMsg.content
+      : (lastUserMsg?.content?.[0]?.text ?? "");
+    if (rawReply) {
+      replyCache.cacheRaw(rawReply, lastUserMsgText);
+    }
+
     // ── Run transformResponse pipeline ─────────────────────
     let finalData = result.data;
     for (const ext of extensions) {
@@ -526,6 +601,11 @@ app.post("/v1/chat/completions", async (req, res) => {
       cache_read: usage?.prompt_tokens_details?.cached_tokens,
       char: typeof finalReply === "string" ? finalReply.slice(0, 300) : null,
     });
+
+   // ── Cache final reply after pipeline ───────────────────
+    if (finalReply) {
+      replyCache.cacheFinal(finalReply);
+    }
 
     // ── Duplicate response detection ───────────────────────
     if (lastReply && finalReply && typeof finalReply === "string") {
@@ -661,6 +741,13 @@ function shutdown(signal) {
     console.warn("[proxy] Forcing exit after timeout");
     process.exit(1);
   }, 10000);
+}
+
+// ── Periodic garbage collection ────────────────────────────
+if (global.gc) {
+  setInterval(() => {
+    global.gc();
+  }, 60_000);
 }
 
 // ── Memory monitoring ──────────────────────────────────────

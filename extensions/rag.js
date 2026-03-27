@@ -44,6 +44,7 @@ const DEFAULT_CONFIG = {
   chunkingStrategy: "per_message", // 'per_message' or 'conversation_turns'
   rules: [],
   blindNextTurn: false,
+  maxCollections: 20, // auto-prune smallest collection when cap is hit
 };
 
 let _configCache = null;
@@ -135,12 +136,62 @@ const _stats = {
 
 // Per-request state (transformRequest → transformResponse)
 const _pendingMap = new Map();
-const PENDING_TTL_MS = 5 * 60 * 1000;
+const PENDING_TTL_MS = 2 * 60 * 1000; // 2 min instead of 5
+const PENDING_MAX_SIZE = 3; // never more than 3 entries
 
 function cleanupPending() {
   const now = Date.now();
   for (const [key, val] of _pendingMap) {
     if (now - val.timestamp > PENDING_TTL_MS) _pendingMap.delete(key);
+  }
+  // Hard cap — if still too many, keep only the most recent
+  if (_pendingMap.size > PENDING_MAX_SIZE) {
+    const entries = [..._pendingMap.entries()];
+    _pendingMap.clear();
+    for (const [k, v] of entries.slice(-PENDING_MAX_SIZE)) {
+      _pendingMap.set(k, v);
+    }
+  }
+}
+
+/**
+ * Prune RAG collections if over the cap.
+ * Deletes the collection with the fewest points (least useful memories).
+ */
+async function pruneCollections(config) {
+  const max = config.maxCollections ?? 20;
+  if (max <= 0) return;
+
+  try {
+    const res = await fetch(`${config.qdrantUrl}/collections`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const all = data.result?.collections ?? [];
+    const ragCollections = all.filter(c => c.name.startsWith(config.collectionPrefix));
+
+    if (ragCollections.length <= max) return;
+
+    // Get point counts for each collection
+    const counts = await Promise.all(
+      ragCollections.map(async (c) => ({
+        name: c.name,
+        points: await getPointCount(c.name, config),
+      })),
+    );
+
+    // Sort by point count ascending — smallest first
+    counts.sort((a, b) => a.points - b.points);
+
+    // Delete smallest collections until we're under the cap
+    const toDelete = counts.slice(0, counts.length - max);
+    for (const col of toDelete) {
+      try {
+        await fetch(`${config.qdrantUrl}/collections/${col.name}`, { method: "DELETE" });
+        console.log(`[rag] Pruned collection "${col.name}" (${col.points} points) — over cap of ${max}`);
+      } catch {}
+    }
+  } catch (e) {
+    console.warn("[rag] Collection pruning failed (non-fatal):", e.message);
   }
 }
 
@@ -460,11 +511,6 @@ async function transformResponse(data) {
   if (!pendingEntry) return data;
   const [pendingKey, pending] = pendingEntry;
   _pendingMap.delete(pendingKey);
-  // Safety: clear any stale entries that might have accumulated
-  if (_pendingMap.size > 10) {
-    console.warn(`[rag] Clearing ${_pendingMap.size} stale pending entries`);
-    _pendingMap.clear();
-  }
 
   const rawText = data?.choices?.[0]?.message?.content ?? "";
   if (!rawText) return data;
@@ -566,6 +612,9 @@ async function transformResponse(data) {
     _stats.lastIndexedChars = indexedNames;
     _stats.lastIndexedMsg = pending.msgCount;
     _stats.totalIndexed += indexedNames.length;
+
+    // Prune if over collection cap (runs in background, non-blocking)
+    pruneCollections(config).catch(() => {});
   }
 
   return finalData;
