@@ -145,11 +145,22 @@ function cleanupPending() {
 }
 
 // Cross-turn state (accumulated char names, emotion, reroll detection)
+const MAX_KNOWN_CHARS = 15; // cap to prevent memory bloat
 let _turnState = {
   lastCharNames: [],
   lastEmotion: "neutral",
   lastUserText: null,
 };
+let _turnStateLastActivity = Date.now();
+const TURN_STATE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+function checkTurnStateReset() {
+  if (Date.now() - _turnStateLastActivity > TURN_STATE_TTL_MS) {
+    _turnState = { lastCharNames: [], lastEmotion: "neutral", lastUserText: null };
+    console.log("[rag] Turn state reset — 30min idle timeout");
+  }
+  _turnStateLastActivity = Date.now();
+}
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
@@ -236,6 +247,8 @@ async function transformRequest(payload) {
   const config = loadConfig();
   if (!config.enabled) return payload;
 
+  checkTurnStateReset();
+
   const messages = payload.messages ?? [];
   const msgCount = messages.length;
   const queryText = buildQueryText(messages, config.queryDepth);
@@ -292,11 +305,13 @@ async function transformRequest(payload) {
     return { ...payload, messages: newMessages };
   }
 
-  // Retrieve context for each known character independently
+  // Retrieve context for known characters (cap at 5 to limit API calls)
+  const MAX_RETRIEVE = 5;
   const contextBlocks = [];
-  const linkedChars = new Set(); // tracks which chars we've already retrieved
+  const linkedChars = new Set();
+  const charsToRetrieve = knownCharNames.slice(0, MAX_RETRIEVE);
 
-  for (const charName of knownCharNames) {
+  for (const charName of charsToRetrieve) {
     linkedChars.add(charName);
     let result = null;
     try {
@@ -336,8 +351,9 @@ async function transformRequest(payload) {
 
   // Cross-character linking — retrieve context for co-occurring characters
   // Only fires when a retrieved chunk mentions another known character
+  const MAX_LINKED = 4;
   const alreadyRetrieved = new Set(contextBlocks.map(b => b.charName));
-  const charsToLink = [...linkedChars].filter(c => !alreadyRetrieved.has(c));
+  const charsToLink = [...linkedChars].filter(c => !alreadyRetrieved.has(c)).slice(0, MAX_LINKED);
 
   if (charsToLink.length > 0) {
     console.log(`[rag] Cross-character linking: ${charsToLink.join(", ")}`);
@@ -431,6 +447,11 @@ async function transformResponse(data) {
   if (!pendingEntry) return data;
   const [pendingKey, pending] = pendingEntry;
   _pendingMap.delete(pendingKey);
+  // Safety: clear any stale entries that might have accumulated
+  if (_pendingMap.size > 10) {
+    console.warn(`[rag] Clearing ${_pendingMap.size} stale pending entries`);
+    _pendingMap.clear();
+  }
 
   const rawText = data?.choices?.[0]?.message?.content ?? "";
   if (!rawText) return data;
@@ -457,10 +478,10 @@ async function transformResponse(data) {
   const foundNames = extractCharNames(cleanText, pending.userName);
 
   // Merge newly found names with known names from previous turns
-  // Use a Set to deduplicate — characters accumulate over the session
+  // Cap to prevent unbounded growth — keep most recent names
   const mergedNames = [
     ...new Set([..._turnState.lastCharNames, ...foundNames]),
-  ];
+  ].slice(-MAX_KNOWN_CHARS);
 
   if (foundNames.length > 0) {
     console.log(`[rag] Characters found in reply: ${foundNames.join(", ")}`);
