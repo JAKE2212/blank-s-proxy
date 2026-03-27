@@ -147,7 +147,8 @@ function cleanupPending() {
 // Cross-turn state (accumulated char names, emotion, reroll detection)
 const MAX_KNOWN_CHARS = 15; // cap to prevent memory bloat
 let _turnState = {
-  lastCharNames: [],
+  lastCharNames: [],       // all chars ever seen (for knowing which collections exist)
+  activeSceneChars: [],    // chars from the LAST reply only (for retrieval)
   lastEmotion: "neutral",
   lastUserText: null,
 };
@@ -156,7 +157,7 @@ const TURN_STATE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 function checkTurnStateReset() {
   if (Date.now() - _turnStateLastActivity > TURN_STATE_TTL_MS) {
-    _turnState = { lastCharNames: [], lastEmotion: "neutral", lastUserText: null };
+    _turnState = { lastCharNames: [], activeSceneChars: [], lastEmotion: "neutral", lastUserText: null };
     console.log("[rag] Turn state reset — 30min idle timeout");
   }
   _turnStateLastActivity = Date.now();
@@ -263,8 +264,10 @@ async function transformRequest(payload) {
       ? lastUserMsg.content
       : (lastUserMsg?.content?.[0]?.text ?? "");
 
-  // Carry known char names + emotion from previous turn
-  const knownCharNames = _turnState.lastCharNames;
+  // Use ACTIVE scene chars for retrieval (only chars from the last reply)
+  // Fall back to all known chars on first turn (when activeSceneChars is empty)
+  const activeChars = _turnState.activeSceneChars;
+  const knownCharNames = activeChars.length > 0 ? activeChars : _turnState.lastCharNames;
   const currentEmotion = _turnState.lastEmotion;
 
   // Detect reroll — same user message as last time
@@ -293,6 +296,16 @@ async function transformRequest(payload) {
       const existing = typeof m.content === "string" ? m.content : "";
       return { ...m, content: `${existing}\n\n${EMOTION_INSTRUCTION}` };
     });
+  }
+
+  // Also check for character names in the current user message
+  // This catches cases where the user mentions a character not in the last reply
+  const userMentionedChars = extractCharNames(userText, userName);
+  const allKnownNames = _turnState.lastCharNames;
+  const validUserMentions = userMentionedChars.filter(c => allKnownNames.includes(c));
+  if (validUserMentions.length > 0) {
+    const merged = [...new Set([...knownCharNames, ...validUserMentions])];
+    knownCharNames.splice(0, knownCharNames.length, ...merged);
   }
 
   // Skip retrieval if no query or no known characters yet
@@ -490,6 +503,8 @@ async function transformResponse(data) {
   // Always carry forward the latest merged list + emotion for next request
   _turnState.lastCharNames = mergedNames;
   _turnState.lastEmotion = emotion;
+  // Track ONLY this reply's characters as the active scene for next retrieval
+  _turnState.activeSceneChars = foundNames;
 
   // Skip indexing on rerolls
   if (pending.isReroll) {
