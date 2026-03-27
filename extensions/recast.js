@@ -15,6 +15,8 @@ const path = require("path");
 const router = express.Router();
 const CONFIG_PATH = path.join(__dirname, "../data/recast-config.json");
 const localModels = require("../lib/local-models");
+const { loadTree, getAllEntries } = require("../lib/tunnelvision/tv-tree");
+const { getLastParsed } = require("../lib/custom-prompt");
 
 // ── Defaults ───────────────────────────────────────────────────────────────────
 
@@ -61,58 +63,54 @@ const DEFAULT_CONFIG = {
 // are replaced at runtime.
 
 const CHECK_PROMPTS = {
-  step1: `You are a quality-control editor for AI roleplay responses.
+  step1: `You are a quality-control editor checking an AI roleplay response against specific framework rules.
 
-You will be given:
-- The full system prompt the AI was instructed to follow
-- The AI's response
+Check ONLY these rules — ignore everything else:
 
-Your job: does the response follow the system prompt's rules?
+1. SCENE HEADER: Response should start with a header like [HH:MM AM/PM, DayName, Month Day, Year] / [Location: ...]. Missing headers are a violation ONLY if the scene has a clear time/place. Casual dialogue mid-scene does not require a new header.
 
-Read the system prompt carefully and check ONLY for rules that are explicitly stated there. Do NOT enforce rules that aren't in the system prompt.
+2. USER SOVEREIGNTY: The response must NEVER write dialogue, actions, thoughts, feelings, or decisions for the user character. It may only describe how NPCs perceive or react to the user. Check if the user character's name appears with any internal thoughts, assumed reactions, or actions they didn't take.
 
-Common things to check IF the system prompt requires them:
-- Formatting rules (narration style, dialogue formatting, etc.)
-- Any explicitly forbidden words, phrases, or behaviors
-- Show-don't-tell (only if the system prompt explicitly requires it)
-- Any required response structure or headers (only if explicitly specified)
+3. PHONETIC VOCALIZATIONS: When a character gasps, moans, groans, sighs, or makes any nonverbal sound, it should be followed by a phonetic rendering in quotes (e.g. "Haa—!" or "Ngh!"). A vocalization described without any phonetic sound is a violation. This only applies to explicit vocalization descriptions — not every breath or movement.
 
-IMPORTANT:
-- If the system prompt doesn't mention a rule, don't enforce it
-- Minor stylistic choices are NOT violations
-- Creative writing decisions (word choice, pacing, metaphor) are NOT violations
-- Only fail if there is a genuine, clear violation of an explicitly stated rule
+4. SCENE CLOSURE: The response should NOT end with a philosophical reflection, thematic summary, or meaning-making statement. It should end on action, dialogue, or an environmental detail.
 
-SYSTEM PROMPT:
+5. FORMAT: Narration should use *asterisks*. Spoken dialogue should use "double quotes". No bullet points or numbered lists in narrative.
+
+Be LENIENT. Only fail for clear, obvious violations — not borderline cases. Minor stylistic choices are fine. Creative decisions are fine. If you're unsure, pass it.
+
+SYSTEM PROMPT (for reference):
 {{SYSTEM_PROMPT}}
 
 AI RESPONSE:
 {{REPLY}}
 
-Answer with exactly one word: YES (the response follows the system prompt's rules) or NO (there is a clear violation of an explicitly stated rule).`,
+Answer with exactly one word: YES (passes) or NO (clear violation of one of the 5 rules above).`,
 
   step2: `You are a character authenticity editor for AI roleplay responses.
 
 You will be given:
-- The character card describing the NPC's personality, voice, speech patterns, and psychology
+- The character card describing NPC personality, voice, and psychology
+- Lorebook data about characters and story events (if available)
 - The user persona
-- Recent conversation messages for context
+- Recent conversation for context
 - The AI's response
 
-Your job: does every character act AND sound like themselves? Are emotional reactions proportional to what actually happened?
+Check these things:
+- Do characters sound like themselves? (vocabulary, verbal tics, speech rhythm, era-appropriate language)
+- Are emotional reactions proportional? (no breakdowns over minor things, no shrugging off heavy moments)
+- Do characters act consistently with their established personality and psychology?
+- If lorebook data is provided, does the response contradict any established character facts?
 
-Focus on:
-- Voice and speech patterns (vocabulary, verbal tics, sentence rhythm, era-appropriate language)
-- Personality consistency (do their actions match their established psychology and wounds?)
-- Proportional reactions (no crying or breaking down over minor things, no shrugging off genuinely devastating events)
-- Behavioral patterns (do they use their established defense mechanisms, not generic ones?)
-
-NOTE ON CHARACTER CARD FORMAT: The character card below may be a clean tagged block, or it may be the opening section of the system prompt. Either way, read it for personality, speech style, and behavioral rules. If no explicit user persona is provided, ignore that section.
-
-IMPORTANT: Characters can surprise us — growth and contradiction are valid. Only fail if the character acts in a way that is fundamentally incompatible with who they are.
+Be LENIENT:
+- Characters CAN surprise us — growth, contradiction, and evolution are valid
+- Only fail if a character acts in a way that is FUNDAMENTALLY incompatible with who they are
+- Minor voice inconsistencies are not violations
+- If no lorebook data is available, judge only against the character card
 
 CHARACTER CARD:
 {{CHAR_CARD}}
+{{TV_CONTEXT}}
 
 USER PERSONA:
 {{USER_PERSONA}}
@@ -123,7 +121,7 @@ RECENT CONVERSATION:
 AI RESPONSE:
 {{REPLY}}
 
-Answer with exactly one word: YES (characters are consistent) or NO (there is a clear character violation).`,
+Answer with exactly one word: YES (characters are consistent) or NO (clear character violation).`,
 
   step3: `You are a world-coherence editor for AI roleplay responses.
 
@@ -179,11 +177,15 @@ Answer with exactly one word: YES (story is progressing) or NO (there is a clear
 // ── Rewrite prompts ────────────────────────────────────────────────────────────
 
 const REWRITE_PROMPTS = {
-  step1: `You are a prose editor. The response below has violated one or more rules from the system prompt.
+  step1: `You are a prose editor. The response below violated one of these specific rules:
 
-Read the system prompt carefully. Fix ONLY the specific violations — do not change anything that isn't broken.
+1. Missing scene header [Time / Location] at the start (add one if the scene has a clear time/place)
+2. Writing dialogue, thoughts, or actions for the user character (remove them)
+3. A nonverbal vocalization (gasp, moan, sigh, etc.) without a phonetic sound in quotes after it (add the phonetic sound)
+4. Ending with a philosophical reflection or thematic summary (cut on action, dialogue, or environment instead)
+5. Wrong format (narration should use *asterisks*, dialogue should use "double quotes")
 
-Preserve all content, events, characters, plot, voice, and writing style. Make the minimum changes necessary to comply with the system prompt's rules.
+Fix ONLY the specific violation. Do not change anything else — preserve all content, events, characters, plot, voice, and style. Make the minimum change necessary.
 
 Respond with only the corrected text. No commentary, no preamble.
 
@@ -195,19 +197,18 @@ RESPONSE TO FIX:
 
   step2: `You are a character authenticity editor. The response below has a character consistency or proportional reaction problem.
 
-Rewrite it so that:
-- Every character acts and speaks in a way that is true to their established personality, psychology, and speech patterns
-- Emotional reactions are proportional to what actually happened — no over-the-top breakdowns for minor events, no dismissive shrugs for genuinely heavy moments
-- Dialogue sounds like that specific person (vocabulary, verbal tics, era-appropriate language, pressure compression)
-- Defense mechanisms and behavioral patterns match the character card
+Fix so that:
+- Characters act and speak true to their established personality and speech patterns
+- Emotional reactions are proportional to what happened
+- Dialogue sounds like that specific person
+- If lorebook data is provided, don't contradict established character facts
 
-NOTE ON CHARACTER CARD FORMAT: The character card below may be a clean tagged block, or it may be the opening section of the system prompt. Read it for personality, voice, and behavioral rules. If no explicit user persona is provided, ignore that section.
-
-Preserve all plot events and narrative content. Only fix the character authenticity issues.
+Make minimum changes. Preserve all plot events and narrative content. Only fix character issues.
 Respond with only the corrected text. No commentary, no preamble.
 
 CHARACTER CARD:
 {{CHAR_CARD}}
+{{TV_CONTEXT}}
 
 USER PERSONA:
 {{USER_PERSONA}}
@@ -254,8 +255,44 @@ RESPONSE TO FIX:
 {{REPLY}}`,
 };
 
-// ── Pending context (stashed in transformRequest, used in transformResponse) ───
+// ── TunnelVision lorebook helper ───────────────────────────────────────────────
 
+/**
+ * Pull relevant character entries from TunnelVision for recast checks.
+ * Returns a formatted string of character lorebook data, or empty string.
+ */
+function getTVCharacterContext() {
+  try {
+    const parsed = getLastParsed();
+    if (!parsed.botName) return "";
+    const tree = loadTree(parsed.botName.toLowerCase().replace(/[^a-z0-9_-]/g, "_"));
+    if (!tree) return "";
+    const entries = getAllEntries(tree);
+    if (!entries.length) return "";
+
+    // Pull character-relevant entries (skip summaries, keep personality/quirk/relationship entries)
+    const charEntries = entries
+      .filter(e => !e.nodeId.startsWith("summaries"))
+      .slice(0, 10) // cap to avoid huge prompts
+      .map(e => `[${e.entry.title}]\n${e.entry.content}`)
+      .join("\n\n");
+
+    const summaryEntries = entries
+      .filter(e => e.nodeId === "summaries" || e.nodeLabel === "Summaries")
+      .slice(0, 5)
+      .map(e => `[${e.entry.title}]\n${e.entry.content}`)
+      .join("\n\n");
+
+    let result = "";
+    if (charEntries) result += `\n\n[TunnelVision — Character Data]\n${charEntries}`;
+    if (summaryEntries) result += `\n\n[TunnelVision — Story Summaries]\n${summaryEntries}`;
+    return result;
+  } catch {
+    return "";
+  }
+}
+
+// ── Pending context (stashed in transformRequest, used in transformResponse) ───
 // Per-request context (transformRequest → transformResponse)
 // Single-slot — safe for single-user, would need a map for concurrent requests
 let _pending = null;
@@ -365,6 +402,7 @@ function fillTemplate(template, vars) {
   return template
     .replace(/\{\{SYSTEM_PROMPT\}\}/g, vars.systemPrompt || "")
     .replace(/\{\{CHAR_CARD\}\}/g, vars.charCard || "")
+    .replace(/\{\{TV_CONTEXT\}\}/g, vars.tvContext || "")
     .replace(/\{\{USER_PERSONA\}\}/g, vars.userPersona || "")
     .replace(/\{\{RECENT\}\}/g, vars.recent || "")
     .replace(/\{\{REPLY\}\}/g, vars.reply || "");
@@ -561,6 +599,7 @@ async function transformResponse(data) {
   const vars = {
     systemPrompt: _pending.systemPrompt,
     charCard: _pending.charCard,
+    tvContext: getTVCharacterContext(),
     userPersona: _pending.userPersona,
     recent: extractRecentMessages(_pending.messages, 6),
   };

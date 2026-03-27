@@ -15,8 +15,8 @@ const {
   getStatus: getBreakerStatus,
 } = require("./lib/circuit-breaker");
 const registerDashboardRoutes = require("./lib/dashboard-routes");
-const { extractUserName } = require("./lib/character-detector");
 const replyCache = require("./lib/reply-cache");
+const { injectPrompt } = require("./lib/custom-prompt");
 
 // ── Build dashboard bundle on startup ─────────────────────
 const { execSync } = require("child_process");
@@ -418,20 +418,8 @@ app.post("/v1/chat/completions", async (req, res) => {
       stream: false,
     };
 
-    // ── Inject user autonomy rule ──────────────────────────
-    const userName = extractUserName(payload.messages);
-
-    if (userName) {
-      const capName = userName.charAt(0).toUpperCase() + userName.slice(1);
-      const rule = `[System Rule: Never write dialogue, actions, thoughts, or decisions for ${capName}. ${capName} is controlled entirely by the user. You may only describe how other characters perceive or react to ${capName}, but never act as them.]`;
-      payload.messages = payload.messages.map(m => {
-        if (m.role !== "system") return m;
-        if (Array.isArray(m.content)) {
-          return { ...m, content: [...m.content, { type: "text", text: rule }] };
-        }
-        return { ...m, content: (m.content || "") + "\n\n" + rule };
-      });
-    }
+    // ── Inject custom system prompt (also strips JanitorAI instructions) ──
+    payload.messages = injectPrompt(payload.messages);
 
     // ── Stash raw system prompt for recast (before extensions modify it)
     const recastExt = extensions.find((e) => e.filename === "recast.js");
