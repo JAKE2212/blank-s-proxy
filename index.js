@@ -1,5 +1,5 @@
 // ============================================================
-// index.js — JanitorAI Proxy Server
+// index.js — Kiana Proxy Server
 // Receives requests from JanitorAI and forwards them to
 // OpenRouter, then returns the response back to JanitorAI.
 // ============================================================
@@ -14,41 +14,8 @@ const {
   callWithBreaker,
   getStatus: getBreakerStatus,
 } = require("./lib/circuit-breaker");
-const registerDashboardRoutes = require("./lib/dashboard-routes");
-const { injectPrompt } = require("./lib/custom-prompt");
 
-// ── Build dashboard bundle on startup ─────────────────────
-const { execSync } = require("child_process");
-try {
-  execSync("node dashboard/build.js", { cwd: __dirname });
-  console.log("[proxy] ✦ Dashboard bundle built");
-} catch (e) {
-  console.warn("[proxy] ⚠ Dashboard bundle build failed:", e.message);
-}
-
-// ── Extension auto-discovery ───────────────────────────────
-// Scans the extensions/ folder and loads any .js files found.
-// Each extension can export { router, transformRequest, transformResponse }
-const EXTENSIONS_DIR = path.join(__dirname, "extensions");
-const extensions = [];
-
-if (fs.existsSync(EXTENSIONS_DIR)) {
-  const files = fs.readdirSync(EXTENSIONS_DIR).filter((f) => f.endsWith(".js"));
-  for (const file of files) {
-    try {
-      const ext = require(path.join(EXTENSIONS_DIR, file));
-      extensions.push({ filename: file, ...ext });
-      const meta = ext.name ? `${ext.name} v${ext.version ?? "?"}` : file;
-      console.log(`[extensions] Loaded: ${meta} (${file})`);
-    } catch (e) {
-      console.warn(`[extensions] Failed to load ${file}:`, e.message);
-    }
-  }
-}
-
-extensions.sort((a, b) => (a.priority ?? 50) - (b.priority ?? 50));
-
-// ── Load environment variables from .env ──────────────────
+// ── Load environment variables ────────────────────────────
 dotenv.config();
 process.on("unhandledRejection", (reason) => {
   console.error("[proxy] Unhandled rejection:", reason?.message ?? reason);
@@ -67,8 +34,35 @@ const PORT = process.env.PORT || 3000;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL;
 
-// ── Enable CORS for all origins ────────────────────────────
-// Required for JanitorAI (browser-based) to reach the proxy
+// ── Extension auto-discovery ───────────────────────────────
+const EXTENSIONS_DIR = path.join(__dirname, "extensions");
+const extensions = [];
+
+function loadExtensions() {
+  extensions.length = 0;
+  if (!fs.existsSync(EXTENSIONS_DIR)) {
+    fs.mkdirSync(EXTENSIONS_DIR, { recursive: true });
+    return;
+  }
+  const files = fs.readdirSync(EXTENSIONS_DIR).filter((f) => f.endsWith(".js"));
+  for (const file of files) {
+    const fullPath = path.join(EXTENSIONS_DIR, file);
+    delete require.cache[require.resolve(fullPath)];
+    try {
+      const ext = require(fullPath);
+      extensions.push({ filename: file, ...ext });
+      const meta = ext.name ? `${ext.name} v${ext.version ?? "?"}` : file;
+      console.log(`[extensions] Loaded: ${meta} (${file})`);
+    } catch (e) {
+      console.warn(`[extensions] Failed to load ${file}:`, e.message);
+    }
+  }
+  extensions.sort((a, b) => (a.priority ?? 50) - (b.priority ?? 50));
+}
+
+loadExtensions();
+
+// ── CORS ───────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
   "https://janitorai.com",
   "https://www.janitorai.com",
@@ -78,7 +72,6 @@ const ALLOWED_ORIGINS = [
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (e.g. Portainer console, curl, mobile apps)
       if (!origin || ALLOWED_ORIGINS.includes(origin)) {
         callback(null, true);
       } else {
@@ -89,11 +82,10 @@ app.use(
   }),
 );
 
-// ── Parse incoming JSON request bodies ────────────────────
+// ── Parse JSON bodies ─────────────────────────────────────
 app.use(express.json({ limit: "10mb" }));
-app.use("/dashboard", express.static(path.join(__dirname, "dashboard")));
 
-// ── Proxy authentication ───────────────────────────────
+// ── Proxy authentication ──────────────────────────────────
 app.use("/v1", (req, res, next) => {
   const auth = req.headers["authorization"] ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
@@ -103,10 +95,10 @@ app.use("/v1", (req, res, next) => {
   res.status(401).json({ error: "Unauthorized" });
 });
 
-// ── Rate limiting ──────────────────────────────────────
+// ── Rate limiting ─────────────────────────────────────────
 const rateLimitMap = new Map();
-const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX = 30; // max requests per window
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX = 30;
 
 app.use("/v1", (req, res, next) => {
   const ip = req.headers["cf-connecting-ip"] ?? req.ip;
@@ -135,31 +127,35 @@ setInterval(() => {
   }
 }, RATE_LIMIT_WINDOW_MS);
 
-// ── Mount extension routes ─────────────────────────────────
-// Each extension's router is mounted at /extensions/<name>
-for (const ext of extensions) {
-  if (ext.router) {
-    const name = ext.filename.replace(".js", "");
-    app.use(`/extensions/${name}`, ext.router);
-    console.log(`[extensions] Mounted router: /extensions/${name}`);
+// ── Mount extension routes ────────────────────────────────
+function mountExtensionRoutes() {
+  for (const ext of extensions) {
+    if (ext.router) {
+      const name = ext.filename.replace(".js", "");
+      app.use(`/extensions/${name}`, ext.router);
+      console.log(`[extensions] Mounted router: /extensions/${name}`);
+    }
   }
 }
-// ── Logging setup ──────────────────────────────────────────
-const LOG_FILE = path.join(__dirname, "logs", "requests.log");
 
-// ── Auto-create logs directory if missing ──────────────
-if (!fs.existsSync(path.join(__dirname, "logs"))) {
-  fs.mkdirSync(path.join(__dirname, "logs"), { recursive: true });
-  console.log("[proxy] Created logs/ directory");
+mountExtensionRoutes();
+
+// ── Logging ───────────────────────────────────────────────
+const LOG_DIR = path.join(__dirname, "logs");
+const LOG_FILE = path.join(LOG_DIR, "requests.log");
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+
+if (!fs.existsSync(LOG_DIR)) {
+  fs.mkdirSync(LOG_DIR, { recursive: true });
 }
 
-// ── Auto-create data directory if missing ──────────────
 if (!fs.existsSync(path.join(__dirname, "data"))) {
   fs.mkdirSync(path.join(__dirname, "data"), { recursive: true });
-  console.log("[proxy] Created data/ directory");
 }
 
-const LOG_MAX_BYTES = 5 * 1024 * 1024; // 5MB
+if (!fs.existsSync(EXTENSIONS_DIR)) {
+  fs.mkdirSync(EXTENSIONS_DIR, { recursive: true });
+}
 
 function rotateLogs() {
   try {
@@ -170,12 +166,11 @@ function rotateLogs() {
     fs.renameSync(LOG_FILE, archive);
     console.log(`[proxy] Log rotated → ${path.basename(archive)}`);
 
-    // ── Delete archives older than 7 days ──────────────
     const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
-    fs.readdirSync(path.join(__dirname, "logs"))
+    fs.readdirSync(LOG_DIR)
       .filter((f) => f.startsWith("requests.") && f.endsWith(".log"))
       .forEach((f) => {
-        const filepath = path.join(__dirname, "logs", f);
+        const filepath = path.join(LOG_DIR, f);
         if (fs.statSync(filepath).mtimeMs < cutoff) {
           fs.unlinkSync(filepath);
           console.log(`[proxy] Deleted old log archive: ${f}`);
@@ -186,13 +181,12 @@ function rotateLogs() {
   }
 }
 
-setInterval(rotateLogs, 5 * 60 * 1000); // check every 5 minutes
+setInterval(rotateLogs, 5 * 60 * 1000);
 
-// ── Sensitive content masking ──────────────────────────
 const MASK_PATTERNS = [
-  /sk-[a-zA-Z0-9\-]{10,}/g, // OpenAI/OpenRouter style keys
-  /Bearer\s+[a-zA-Z0-9\-._~+/]+=*/g, // Bearer tokens
-  /key["\s:=]+["']?[a-zA-Z0-9\-]{16,}/gi, // generic key= patterns
+  /sk-[a-zA-Z0-9\-]{10,}/g,
+  /Bearer\s+[a-zA-Z0-9\-._~+/]+=*/g,
+  /key["\s:=]+["']?[a-zA-Z0-9\-]{16,}/gi,
 ];
 
 function maskSensitive(str) {
@@ -213,32 +207,29 @@ function writeLog(entry) {
     if (err) console.error("[proxy] Failed to write log:", err.message);
   });
   console.log(
-    typeof entry === "string" ? entry : "[proxy]" + JSON.stringify(entry),
+    typeof entry === "string" ? entry : "[proxy] " + JSON.stringify(entry),
   );
 }
 
-// ── Config ─────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────
 const CONFIG = {
-  MAX_RETRIES: 3, // How many times to retry a failed request
-  RETRY_DELAY_MS: 1000, // Base delay between retries (ms)
+  MAX_RETRIES: 3,
+  RETRY_DELAY_MS: 1000,
 };
 
-// ── Helper: delay for retries ──────────────────────────────
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ── Request ID ─────────────────────────────────────────────
 function genRequestId() {
   return Math.random().toString(36).slice(2, 8).toUpperCase();
 }
 
-// ── Model name normalization ───────────────────────────────
 function normalizeModel(model) {
   return (model ?? "").replace(/^[a-z-]+\//, "");
 }
 
-// ── Helper: send request to OpenRouter with retry logic ────
+// ── Send to OpenRouter with retry logic ───────────────────
 async function sendToOpenRouter(payload) {
   let lastError;
 
@@ -262,7 +253,6 @@ async function sendToOpenRouter(payload) {
         }),
       );
 
-      // ── Non-OK response from OpenRouter ───────────────────
       if (!response.ok) {
         const error = await response
           .json()
@@ -273,14 +263,11 @@ async function sendToOpenRouter(payload) {
         });
         lastError = { status: response.status, error };
 
-        // Don't retry on 4xx errors — only on 5xx or network issues
         if (response.status < 500) break;
-
-        await delay(CONFIG.RETRY_DELAY_MS * attempt); // backoff: 1s, 2s, 3s
+        await delay(CONFIG.RETRY_DELAY_MS * attempt);
         continue;
       }
 
-      // ── Success ────────────────────────────────────────────
       const data = await response.json();
       writeLog({
         event: "system",
@@ -301,15 +288,15 @@ async function sendToOpenRouter(payload) {
   return { ok: false, ...lastError };
 }
 
-// ── Health check endpoint ──────────────────────────────────
+// ── Health check ──────────────────────────────────────────
+const START_TIME = Date.now();
+let lastRequestTime = null;
+let lastReply = null;
+const RESTART_HISTORY = [{ time: new Date().toISOString(), reason: "startup" }];
+
 app.get("/", (req, res) => {
   res.json({ ok: true, message: "Proxy is running!" });
 });
-
-const START_TIME = Date.now();
-let lastRequestTime = null;
-const RESTART_HISTORY = [{ time: new Date().toISOString(), reason: "startup" }];
-let lastReply = null;
 
 app.get("/health", (req, res) => {
   res.json({
@@ -334,23 +321,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ── Dashboard routes ───────────────────────────────────────
-registerDashboardRoutes(app, {
-  LOG_FILE,
-  CONFIG,
-  PORT,
-  DEFAULT_MODEL,
-  extensions,
-  EXTENSIONS_DIR,
-  RESTART_HISTORY,
-  START_TIME,
-  getBreakerStatus,
-  getQueueStats,
-  lastRequestTime: () => lastRequestTime,
-});
-
-// ── Main proxy endpoint ────────────────────────────────────
-// JanitorAI sends requests to /v1/chat/completions
+// ── Main proxy endpoint ───────────────────────────────────
 app.post("/v1/chat/completions", async (req, res) => {
   let done;
   try {
@@ -380,14 +351,14 @@ app.post("/v1/chat/completions", async (req, res) => {
         .json({ error: "Request too large — max 2M characters" });
     }
 
-    // ── Queue the request ──────────────────────────────────
+    // ── Queue ──────────────────────────────────────────
     try {
       done = await enqueue();
     } catch (qErr) {
       return res.status(qErr.status ?? 503).json(qErr.error);
     }
 
-    // ── Log incoming request ───────────────────────────────
+    // ── Log incoming request ───────────────────────────
     const lastUserMsg = body.messages?.findLast((m) => m.role === "user");
     lastRequestTime = new Date().toISOString();
     writeLog({
@@ -401,42 +372,20 @@ app.post("/v1/chat/completions", async (req, res) => {
           : null,
     });
 
+    // ── Build payload ──────────────────────────────────
     const messages = applyPromptCaching(body.messages ?? [], model);
-
-    // ── Build payload — force streaming off ────────────────
-    const payload = {
+    let payload = {
       ...body,
       model,
       messages,
       stream: false,
     };
 
-    // ── Inject custom system prompt (also strips JanitorAI instructions) ──
-    payload.messages = injectPrompt(payload.messages);
-    
-    // ── Pre-extract bot name for TunnelVision before extensions transform messages
-    const tvExt = extensions.find((e) => e.filename === "tunnelvision.js");
-    if (tvExt?.primeTreeName) {
-      tvExt.primeTreeName(body.messages);
-    }
-
-    // ── Run through extension pipeline ─────────────────────
-    // RAG and TunnelVision run in parallel since they modify different
-    // parts of the payload (RAG = system prompt content, TV = tools).
-    // All other extensions run sequentially in priority order.
-    let transformedPayload = payload;
-
-    const ragExt = extensions.find(e => e.filename === "rag.js");
-    const tvExtPipeline = extensions.find(e => e.filename === "tunnelvision.js");
-    const parallelSet = new Set(["rag.js", "tunnelvision.js"]);
-
-    // Phase 1: Run extensions BEFORE RAG/TV (priority < 25)
+    // ── transformRequest pipeline (sequential, priority order) ──
     for (const ext of extensions) {
-      if (parallelSet.has(ext.filename)) continue;
-      if ((ext.priority ?? 50) >= 25) continue;
       if (ext.transformRequest) {
         try {
-          transformedPayload = await ext.transformRequest(transformedPayload);
+          payload = await ext.transformRequest(payload);
         } catch (e) {
           writeLog({
             event: "error",
@@ -446,69 +395,8 @@ app.post("/v1/chat/completions", async (req, res) => {
       }
     }
 
-    // Phase 2: Run RAG + TunnelVision in parallel
-    if (ragExt?.transformRequest || tvExtPipeline?.transformRequest) {
-      const parallelPayload = { ...transformedPayload };
-      const [ragResult, tvResult] = await Promise.allSettled([
-        ragExt?.transformRequest
-          ? ragExt.transformRequest({ ...parallelPayload })
-          : Promise.resolve(parallelPayload),
-        tvExtPipeline?.transformRequest
-          ? tvExtPipeline.transformRequest({ ...parallelPayload })
-          : Promise.resolve(parallelPayload),
-      ]);
-
-      // Merge results: RAG modifies messages (system prompt content), TV adds tools
-      const ragPayload = ragResult.status === "fulfilled" ? ragResult.value : parallelPayload;
-      const tvPayload = tvResult.status === "fulfilled" ? tvResult.value : parallelPayload;
-
-      if (ragResult.status === "rejected") {
-        writeLog({ event: "error", message: `[extensions] RAG transformRequest failed: ${ragResult.reason?.message}` });
-      }
-      if (tvResult.status === "rejected") {
-        writeLog({ event: "error", message: `[extensions] TunnelVision transformRequest failed: ${tvResult.reason?.message}` });
-      }
-
-      // Take messages from RAG (has injected memory context)
-      // Take tools + tool_choice from TV (has injected tool definitions)
-      transformedPayload = {
-        ...ragPayload,
-        tools: tvPayload.tools ?? ragPayload.tools,
-        tool_choice: tvPayload.tool_choice ?? ragPayload.tool_choice,
-      };
-    }
-
-    // Phase 3: Run extensions AFTER RAG/TV (priority > 26)
-    for (const ext of extensions) {
-      if (parallelSet.has(ext.filename)) continue;
-      if ((ext.priority ?? 50) <= 26) continue;
-      if (ext.transformRequest) {
-        try {
-          transformedPayload = await ext.transformRequest(transformedPayload);
-        } catch (e) {
-          writeLog({
-            event: "error",
-            message: `[extensions] ${ext.name ?? ext.filename} transformRequest failed: ${e.message}`,
-          });
-        }
-      }
-    }
-
-    let result;
-    try {
-      result = tvExt?.wrapSendWithToolLoop
-        ? await tvExt.wrapSendWithToolLoop(
-            transformedPayload,
-            sendToOpenRouter,
-          )
-        : await sendToOpenRouter(transformedPayload);
-    } catch (tvErr) {
-      console.error(
-        "[tunnelvision] Tool loop failed, falling back to direct send:",
-        tvErr.message,
-      );
-      result = await sendToOpenRouter(transformedPayload);
-    }
+    // ── Send to OpenRouter ─────────────────────────────
+    const result = await sendToOpenRouter(payload);
 
     if (!result.ok) {
       writeLog({
@@ -522,7 +410,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       return res.status(result.status).json(result.error);
     }
 
-    // ── Truncation warning ─────────────────────────────────
+    // ── Truncation warning ─────────────────────────────
     const stopReason = result.data?.choices?.[0]?.finish_reason;
     if (stopReason === "length") {
       writeLog({
@@ -532,7 +420,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       });
     }
 
-    // ── Run transformResponse pipeline ─────────────────────
+    // ── transformResponse pipeline (sequential, priority order) ──
     let finalData = result.data;
     for (const ext of extensions) {
       if (ext.transformResponse) {
@@ -548,7 +436,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       }
     }
 
-    // ── Log token usage (post-transform) ───────────────────
+    // ── Log token usage (post-transform) ───────────────
     const usage = result.data?.usage;
     const finalReply = finalData?.choices?.[0]?.message?.content;
     writeLog({
@@ -562,14 +450,15 @@ app.post("/v1/chat/completions", async (req, res) => {
       char: typeof finalReply === "string" ? finalReply.slice(0, 300) : null,
     });
 
-    // ── Duplicate response detection ───────────────────────
+    // ── Duplicate response detection ───────────────────
     if (lastReply && finalReply && typeof finalReply === "string") {
       const len = Math.min(finalReply.length, lastReply.length);
       let matches = 0;
       for (let i = 0; i < len; i++) {
         if (finalReply[i] === lastReply[i]) matches++;
       }
-      const similarity = matches / Math.max(finalReply.length, lastReply.length);
+      const similarity =
+        matches / Math.max(finalReply.length, lastReply.length);
       if (similarity > 0.9) {
         writeLog({
           event: "system",
@@ -590,9 +479,9 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 });
 
-// ── Auto-reload extensions on file change ──────────────
+// ── Extension hot-reload ──────────────────────────────────
 let reloadTimer = null;
-const RELOAD_DELAY_MS = 5000; // 5 second debounce
+const RELOAD_DELAY_MS = 5000;
 
 fs.watch(EXTENSIONS_DIR, (eventType, filename) => {
   if (!filename?.endsWith(".js")) return;
@@ -601,37 +490,19 @@ fs.watch(EXTENSIONS_DIR, (eventType, filename) => {
   );
 
   clearTimeout(reloadTimer);
-  reloadTimer = setTimeout(async () => {
+  reloadTimer = setTimeout(() => {
     try {
       console.log("[extensions] Auto-reloading extensions...");
 
-      extensions.length = 0;
       if (app._router?.stack) {
         app._router.stack = app._router.stack.filter(
           (layer) => !layer?.regexp?.toString().includes("extensions"),
         );
       }
 
-      const files = fs
-        .readdirSync(EXTENSIONS_DIR)
-        .filter((f) => f.endsWith(".js"));
-      for (const file of files) {
-        const fullPath = path.join(EXTENSIONS_DIR, file);
-        delete require.cache[require.resolve(fullPath)];
-        try {
-          const ext = require(fullPath);
-          extensions.push({ filename: file, ...ext });
-          if (ext.router) {
-            const name = file.replace(".js", "");
-            app.use(`/extensions/${name}`, ext.router);
-          }
-          console.log(`[extensions] Auto-reloaded: ${file}`);
-        } catch (e) {
-          console.warn(`[extensions] Failed to reload ${file}:`, e.message);
-        }
-      }
+      loadExtensions();
+      mountExtensionRoutes();
 
-      extensions.sort((a, b) => (a.priority ?? 50) - (b.priority ?? 50));
       console.log(
         `[extensions] Auto-reload complete — ${extensions.length} loaded`,
       );
@@ -641,7 +512,7 @@ fs.watch(EXTENSIONS_DIR, (eventType, filename) => {
   }, RELOAD_DELAY_MS);
 });
 
-// ── Startup health check ───────────────────────────────
+// ── Startup health check ──────────────────────────────────
 async function checkOpenRouter() {
   try {
     const res = await fetch("https://openrouter.ai/api/v1/models", {
@@ -659,7 +530,7 @@ async function checkOpenRouter() {
   }
 }
 
-// ── Start the server ───────────────────────────────────────
+// ── Start server ──────────────────────────────────────────
 const server = app.listen(PORT, () => {
   const line = "─".repeat(48);
   console.log(`[proxy] ${line}`);
@@ -683,7 +554,7 @@ const server = app.listen(PORT, () => {
   checkOpenRouter();
 });
 
-// ── Graceful shutdown ──────────────────────────────────
+// ── Graceful shutdown ─────────────────────────────────────
 function shutdown(signal) {
   RESTART_HISTORY.push({ time: new Date().toISOString(), reason: signal });
   console.log(`[proxy] ${signal} received — shutting down gracefully`);
@@ -691,25 +562,24 @@ function shutdown(signal) {
     console.log("[proxy] Server closed — exiting");
     process.exit(0);
   });
-  // Force exit after 10s if server hasn't closed
   setTimeout(() => {
     console.warn("[proxy] Forcing exit after timeout");
     process.exit(1);
   }, 10000);
 }
 
-// ── Periodic garbage collection ────────────────────────────
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+// ── Periodic GC ───────────────────────────────────────────
 if (global.gc) {
-  setInterval(() => {
-    global.gc();
-  }, 60_000);
+  setInterval(() => global.gc(), 60_000);
 }
 
-let lastMemoryWarn = null;
-
-// ── Memory monitoring ──────────────────────────────────────
+// ── Memory monitoring ─────────────────────────────────────
 const MEMORY_WARN_MB = 512;
 const MEMORY_RESTART_MB = 768;
+let lastMemoryWarn = null;
 
 setInterval(() => {
   const mb = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
@@ -722,7 +592,4 @@ setInterval(() => {
       lastMemoryWarn = Date.now();
     }
   }
-}, 30000); // check every 30s
-
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+}, 30000);
